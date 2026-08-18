@@ -4,20 +4,21 @@
   "description": "DSH dual-surface Cordis plugin: a version badge with one-click auto-update for the DeepSeek Harness web UI.",
   "type": "module",
   "main": "lib/index.js",
-  "types": "lib/types/index.d.ts",
+  "types": "lib/index.d.ts",
   "files": [
     "lib/index.js",
+    "lib/index.d.ts",
     "lib/invariant.js",
-    "lib/types/**/*.d.ts",
+    "lib/invariant.d.ts",
     "src/client.tsx"
   ],
   "exports": {
     ".": {
-      "types": "./lib/types/index.d.ts",
+      "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
     "./invariant": {
-      "types": "./lib/types/invariant.d.ts",
+      "types": "./lib/invariant.d.ts",
       "default": "./lib/invariant.js"
     },
     "./client": {
