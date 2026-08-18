@@ -1,0 +1,72 @@
+{
+  "name": "dsh-version-autoupdate",
+  "version": "0.1.0",
+  "description": "DSH dual-surface Cordis plugin: a version badge with one-click auto-update for the DeepSeek Harness web UI.",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "files": [
+    "lib/index.js",
+    "lib/invariant.js",
+    "lib/types/**/*.d.ts",
+    "src/client.tsx"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./invariant": {
+      "types": "./lib/types/invariant.d.ts",
+      "default": "./lib/invariant.js"
+    },
+    "./client": {
+      "types": "./src/client.tsx",
+      "default": "./src/client.tsx"
+    },
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "rm -rf lib",
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
+    "test": "npm run build"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "version",
+    "autoupdate",
+    "updater"
+  ],
+  "author": "han0423",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Z-6354/dsh-version-autoupdate.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Z-6354/dsh-version-autoupdate/issues"
+  },
+  "homepage": "https://github.com/Z-6354/dsh-version-autoupdate#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.7",
+    "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.7"
+  }
+}
