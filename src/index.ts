@@ -523,13 +523,46 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   const registerRoutes = () => {
     if (!webServer) return;
+    /**
+     * Reject cross-origin write requests (CSRF guard). The write endpoint
+     * triggers a global `npm install`, so no third-party page may invoke it.
+     * Same-origin browsers send an Origin/Referer that matches the request
+     * Host; requests without either (curl, same-page scripts) are allowed.
+     * Returns true when the request is permitted.
+     */
+    const isSameOrigin = (req: IncomingMessage): boolean => {
+      const origin = req.headers.origin ?? req.headers.referer;
+      if (!origin) return true;
+      const host = req.headers.host;
+      if (!host) return false;
+      const allowed = ['127.0.0.1', 'localhost'].some(
+        (h) => host === h || host.startsWith(h + ':'),
+      );
+      let originHost: string;
+      try {
+        originHost = new URL(origin).host;
+      } catch {
+        return false;
+      }
+      // Trust the loopback origin outright; otherwise require it to equal the
+      // request Host (same-origin write).
+      const originMatch = originHost === host || originHost.replace(/:\d+$/, '') === host.replace(/:\d+$/, '');
+      return allowed || originMatch;
+    };
+
+    const rejectForbidden = (req: IncomingMessage, res: ServerResponse) => {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, busy: false, message: '\u62d2\u7edd\u8de8\u57df\u66f4\u65b0\u8bf7\u6c42' }));
+      void req;
+    };
+
     webServer.register({
       kind: 'exact',
       path: '/dsh-version-updater/status',
       handler: async (_req, res) => {
         try {
           const payload = await statusPayload(Boolean(cfg.force));
-          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
           res.end(JSON.stringify(payload));
         } catch (e) {
           res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -541,6 +574,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       kind: 'exact',
       path: '/dsh-version-updater/start-update',
       handler: async (req, res) => {
+        if (!isSameOrigin(req)) {
+          rejectForbidden(req, res);
+          return;
+        }
         try {
           await readBody(req);
         } catch {
@@ -574,7 +611,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           void run;
           return { ok: true, busy: false };
         })();
-        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
         res.end(JSON.stringify(payload));
       },
     });
