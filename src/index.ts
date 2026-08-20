@@ -25,11 +25,23 @@ export const name = 'dsh-version-autoupdate';
 export const inject = ['webServer', 'subprocess', 'fs', 'sandboxPolicy', 'timer'];
 
 /** Package description shown by the DSH plugin inventory. */
+export type Channel = 'stable' | 'preview';
+
 export interface Config {
   /** Package manager used to update DSH. Defaults to discovering npm/pnpm/yarn. */
   packageManager?: 'npm' | 'pnpm' | 'yarn' | 'auto';
   /** Regenerate everything from the registry on status even after a cache hit. */
   force?: boolean;
+  /**
+   * Which version the updater targets.
+   *  - 'preview' (default): the highest published version, including
+   *    pre-release builds (e.g. 0.1.0-rc.8, a future 0.6.0-rc.N).
+   *  - 'stable': only the highest version without a pre-release suffix.
+   * Coverage starts at DSH 0.1.0-rc.6 and up; the target is always the
+   * semantic maximum published to the registry, never the `latest` dist-tag
+   * (which historically lags the true highest version).
+   */
+  channel?: Channel;
   /**
    * Extra hostnames allowed to POST to the update endpoint (CSRF allow-list),
    * for installations reached through a reverse proxy whose Host header is
@@ -49,6 +61,10 @@ export const Config: z<Config> = z.object({
     .boolean()
     .default(false)
     .description('Bypass per-call caching of registry lookups.'),
+  channel: z
+    .union(['stable', 'preview'])
+    .default('preview')
+    .description('Update target: preview (highest version incl. pre-release) or stable (highest release only).'),
   trustedOrigins: z
     .array(z.string())
     .default([])
@@ -62,7 +78,16 @@ const KNOWN_DEPLOYMENT_ROOTS = [
 export interface DshVersionInfo {
   runningVersion: string | null;
   installedVersion: string | null;
+  /** Highest published version included by the active channel (update target). */
   latestVersion: string | null;
+  /** Highest published stable version (no pre-release suffix). */
+  stableLatest: string | null;
+  /** Highest published version including pre-releases. */
+  previewLatest: string | null;
+  /** The active channel. */
+  channel: Channel;
+  /** Why we picked the target, for the UI. */
+  note?: string;
   status: 'up-to-date' | 'update-available' | 'update-done-restart' | 'unknown';
 }
 
@@ -79,12 +104,20 @@ export interface UpdateState {
   latest: string | null;
 }
 
+/** Registry-derived candidates. */
+export interface VersionCandidates {
+  /** Highest version with no pre-release suffix. */
+  stableMax: string | null;
+  /** Highest version overall (pre-releases included). */
+  previewMax: string | null;
+}
+
 const NODE_INFO_SCRIPT =
   'console.log(JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version }));';
 
 const NODE_FETCH_SCRIPT = [
   '(async () => {',
-  "  const r = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh/latest', { signal: AbortSignal.timeout(15000) });",
+  "  const r = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh', { signal: AbortSignal.timeout(20000), headers: { Accept: 'application/vnd.npm.install-v1+json' } });",
   '  console.log(JSON.stringify({ status: r.status, body: await r.text() }));',
   '})().catch((e) => { console.log(JSON.stringify({ status: 0, body: String((e && e.message) || e) })); });',
 ].join('\n');
@@ -151,18 +184,49 @@ interface CollectHandle {
   terminate(): void;
 }
 
+/** Pick the highest version from a list, optionally filtering pre-releases (those carrying a `-` suffix). */
+function maxVersion(versions: string[], includePrerelease: boolean): string | null {
+  let best: string | null = null;
+  for (const v of versions) {
+    const parts = semverParts(v);
+    if (!parts) continue;
+    if (!includePrerelease && parts.pre.length > 0) continue;
+    if (best === null || versionCompare(v, best) > 0) best = v;
+  }
+  return best;
+}
+
+/** Reduce a registry version-manifest to the stable and preview maxima. */
+function candidatesFromVersions(versions: string[]): VersionCandidates {
+  const stableMax = maxVersion(versions, false);
+  const previewMax = maxVersion(versions, true);
+  return { stableMax, previewMax };
+}
+
 /** Wrap a fetch to npm registry. Prefers the host web service, falls back to a node subprocess. */
-async function fetchLatestVersion(ctx: Context): Promise<string | null> {
+async function fetchVersionCandidates(ctx: Context): Promise<VersionCandidates | null> {
+  const body = await fetchRegistryBody(ctx);
+  if (!body) return null;
+  try {
+    const pkg = JSON.parse(body) as { versions?: Record<string, unknown> };
+    if (!pkg || typeof pkg.versions !== 'object' || pkg.versions === null) return null;
+    return candidatesFromVersions(Object.keys(pkg.versions));
+  } catch {
+    return null;
+  }
+}
+
+/** Fetch the raw @deepseek-ai/dsh registry manifest, via web service then node subprocess. */
+async function fetchRegistryBody(ctx: Context): Promise<string | null> {
   // 1. Prefer the web service if present.
   const webSvc = ctx.get('web') as
     | { fetch(req: { url: string }): Promise<{ statusCode: number; body: { kind: string; content: string } }> }
     | undefined;
   if (webSvc) {
     try {
-      const res = await webSvc.fetch({ url: 'https://registry.npmjs.org/@deepseek-ai/dsh/latest' });
+      const res = await webSvc.fetch({ url: 'https://registry.npmjs.org/@deepseek-ai/dsh' });
       if (res && res.statusCode === 200 && typeof res.body?.content === 'string') {
-        const data = JSON.parse(res.body.content) as { version?: string };
-        if (typeof data.version === 'string') return data.version;
+        return res.body.content;
       }
     } catch {
       /* fall through */
@@ -200,24 +264,21 @@ async function fetchLatestVersion(ctx: Context): Promise<string | null> {
       argv: [nodeExe, '-e', NODE_FETCH_SCRIPT],
       cwd,
       stdio: { stdin: 'ignore', stdout: { maxBytes: 131072 }, stderr: { maxBytes: 131072 } },
-      graceMs: 20000,
+      graceMs: 25000,
     });
   } catch {
     return null;
   }
   const timer = ctx.get('timer') as { timeout(fn: () => void, ms: number): () => void } | undefined;
   let clearTimer: (() => void) | undefined;
-  if (timer) clearTimer = timer.timeout(() => handle?.terminate(), 20000);
+  if (timer) clearTimer = timer.timeout(() => handle?.terminate(), 25000);
   try {
     const outcome = await handle.done;
     const text = handle.collected?.stdout?.readFrom(0).text ?? '';
     if (outcome.exitCode !== 0) return null;
     const line = text.trim().split(/\r?\n/).filter(Boolean).pop() || '{}';
     const data = JSON.parse(line) as { status?: number; body?: string };
-    if (data.status === 200 && typeof data.body === 'string') {
-      const pkg = JSON.parse(data.body) as { version?: string };
-      if (typeof pkg.version === 'string') return pkg.version;
-    }
+    if (data.status === 200 && typeof data.body === 'string') return data.body;
   } catch {
     return null;
   } finally {
@@ -321,9 +382,11 @@ export function apply(ctx: Context, config: Config = {}): void {
   const cfg = config || {};
 
   // Caches.
-  let latestCache: { t: number; v: string | null } = { t: 0, v: null };
+  let versionCache: { t: number; v: VersionCandidates | null } = { t: 0, v: null };
   let installedCache: { t: number; v: string | null } = { t: 0, v: null };
   const runningPromise: Promise<string | null> = readInstalledVersion(ctx).catch(() => null);
+
+  const channel: Channel = cfg.channel === 'stable' ? 'stable' : 'preview';
 
   // Update state machine.
   const updateState: UpdateState = {
@@ -339,12 +402,22 @@ export function apply(ctx: Context, config: Config = {}): void {
     latest: null,
   };
 
-  const getLatest = async (force = false): Promise<string | null> => {
+  const getCandidates = async (force = false): Promise<VersionCandidates | null> => {
     const now = Date.now();
-    if (!force && latestCache.v !== null && now - latestCache.t < 120000) return latestCache.v;
-    const v = await fetchLatestVersion(ctx);
-    latestCache = { t: now, v };
+    if (!force && versionCache.v !== null && now - versionCache.t < 120000) return versionCache.v;
+    const v = await fetchVersionCandidates(ctx);
+    versionCache = { t: now, v };
     return v;
+  };
+
+  /** Resolve the update target for the active channel, falling back across channels. */
+  const resolveTarget = (cands: VersionCandidates | null): { version: string | null; note: string } => {
+    if (!cands) return { version: null, note: '' };
+    const pick = channel === 'stable' ? cands.stableMax : cands.previewMax;
+    if (pick) return { version: pick, note: channel === 'stable' ? 'stable' : 'preview' };
+    // Chosen channel has nothing (e.g. stable with only pre-releases) → fall back.
+    const fb = channel === 'stable' ? cands.previewMax : cands.stableMax;
+    return fb ? { version: fb, note: (channel === 'stable' ? 'preview' : 'stable') + '\uff08\u56de\u9000\uff09' } : { version: null, note: '' };
   };
 
   const getInstalled = async (): Promise<string | null> => {
@@ -475,7 +548,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       updateState.system = system;
       const before = await getInstalled();
       updateState.before = before;
-      const latest = await getLatest(true);
+      const cands = await getCandidates(true);
+      const { version: latest, note } = resolveTarget(cands);
       updateState.latest = latest;
       if (!latest) {
         updateState.phase = 'error';
@@ -532,18 +606,23 @@ export function apply(ctx: Context, config: Config = {}): void {
   async function statusPayload(force = false): Promise<DshVersionInfo & { update: UpdateState; system: UpdateState['system'] }> {
     let running: string | null = null;
     let installed: string | null = null;
-    let latest: string | null = null;
+    let cands: VersionCandidates | null = null;
     try {
       running = await runningPromise;
       installed = await getInstalled();
-      latest = await getLatest(force);
+      cands = await getCandidates(force);
     } catch {
       /* partial ok */
     }
+    const { version: latest, note } = resolveTarget(cands);
     return {
       runningVersion: running,
       installedVersion: installed,
       latestVersion: latest,
+      stableLatest: cands?.stableMax ?? null,
+      previewLatest: cands?.previewMax ?? null,
+      channel,
+      note,
       status: computeStatus(running, installed, latest),
       system: updateState.system,
       update: { ...updateState },

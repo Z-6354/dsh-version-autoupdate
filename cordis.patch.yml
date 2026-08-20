@@ -3,6 +3,7 @@
 # Loads the host half (version status + one-click auto-update API). Tune the
 # runtime behaviour from the profile/home patch if needed:
 #   - packageManager: 'auto' | 'npm' | 'pnpm' | 'yarn'
+#   - channel: 'preview' (default; highest version incl. pre-releases) | 'stable'
 #   - force: boolean (bypass registry cache on /status)
 - insert:
     - id: dsh-version-autoupdate
@@ -10,5 +11,6 @@
       config:
         packageManager: auto
         force: false
+        channel: preview
         # reverse-proxied public origins allowed to trigger updates
         trustedOrigins: [dsh.wannian.fun, wannian.fun, www.wannian.fun]

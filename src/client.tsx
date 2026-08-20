@@ -17,6 +17,10 @@ interface DshStatus {
   runningVersion: string | null;
   installedVersion: string | null;
   latestVersion: string | null;
+  stableLatest: string | null;
+  previewLatest: string | null;
+  channel: 'stable' | 'preview';
+  note?: string;
   status: string;
   system?: { os: string; arch: string; node: string; installMethod: string } | null;
   update?: {
@@ -62,7 +66,16 @@ function Badge(): React.ReactElement {
     request('/dsh-version-updater/status')
       .then((r) => setSt(r as DshStatus))
       .catch(() =>
-        setSt({ runningVersion: null, installedVersion: null, latestVersion: null, status: 'error', update: null }),
+        setSt({
+          runningVersion: null,
+          installedVersion: null,
+          latestVersion: null,
+          stableLatest: null,
+          previewLatest: null,
+          channel: 'preview',
+          status: 'error',
+          update: null,
+        }),
       );
   };
 
@@ -133,7 +146,10 @@ function Badge(): React.ReactElement {
     ['\u5b89\u88c5\u65b9\u5f0f', st?.system?.installMethod ?? '\u2014'],
     ['\u5f53\u524d\u8fd0\u884c', st?.runningVersion ?? '\u2014'],
     ['\u5df2\u5b89\u88c5', st?.installedVersion ?? '\u2014'],
-    ['\u6700\u65b0\u7248\u672c', st?.latestVersion ?? '\u2014'],
+    ['\u66f4\u65b0\u901a\u9053', st ? (st.channel === 'stable' ? '\u7a33\u5b9a\u7248\u00b7stable' : '\u9884\u89c8\u7248\u00b7preview') : '\u2014'],
+    ['\u9884\u89c8\u6700\u65b0', st?.previewLatest ?? '\u2014'],
+    ['\u7a33\u5b9a\u6700\u65b0', st?.stableLatest ?? '\u2014'],
+    ['\u76ee\u6807\u7248\u672c', st?.latestVersion ? `v${st.latestVersion}` + (st.note && st.note !== st.channel ? ` \uff08${st.note}\uff09` : '') : '\u2014'],
   ];
 
   let action: React.ReactElement | null = null;
