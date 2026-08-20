@@ -12,6 +12,7 @@
     "lib/invariant.d.ts",
     "lib/client.js",
     "lib/client.js.map",
+    "cordis.patch.yml",
     "src/client.tsx"
   ],
   "exports": {
@@ -31,6 +32,9 @@
     "./package.json": "./package.json"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [

@@ -1,0 +1,12 @@
+# dsh-version-autoupdate bundle patch.
+#
+# Loads the host half (version status + one-click auto-update API). Tune the
+# runtime behaviour from the profile/home patch if needed:
+#   - packageManager: 'auto' | 'npm' | 'pnpm' | 'yarn'
+#   - force: boolean (bypass registry cache on /status)
+- insert:
+    - id: dsh-version-autoupdate
+      name: dsh-version-autoupdate
+      config:
+        packageManager: auto
+        force: false
