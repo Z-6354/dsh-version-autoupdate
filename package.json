@@ -1,6 +1,6 @@
 {
   "name": "dsh-version-autoupdate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "DSH dual-surface Cordis plugin: a version badge with one-click auto-update for the DeepSeek Harness web UI.",
   "type": "module",
   "main": "lib/index.js",
