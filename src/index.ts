@@ -14,12 +14,29 @@ import z from '@deepseek-ai/schemastery';
  */
 export const name = 'dsh-version-autoupdate';
 
+/**
+ * Services the host half depends on. Declaring `inject` tells DSH/Cordis to
+ * activate this plugin only once these are ready and to expose them on the
+ * context — most importantly `webServer`, without which the HTTP routes would
+ * be registered too early (before the web server listens) and never serve.
+ * `web` is deliberately NOT injected: this deployment has no fetch provider,
+ * and the plugin falls back to a subprocess fetch when it is absent.
+ */
+export const inject = ['webServer', 'subprocess', 'fs', 'sandboxPolicy', 'timer'];
+
 /** Package description shown by the DSH plugin inventory. */
 export interface Config {
   /** Package manager used to update DSH. Defaults to discovering npm/pnpm/yarn. */
   packageManager?: 'npm' | 'pnpm' | 'yarn' | 'auto';
   /** Regenerate everything from the registry on status even after a cache hit. */
   force?: boolean;
+  /**
+   * Extra hostnames allowed to POST to the update endpoint (CSRF allow-list),
+   * for installations reached through a reverse proxy whose Host header is
+   * rewritten to loopback. Loopback and the request's own Host are always
+   * allowed. Only the bare hostname is compared.
+   */
+  trustedOrigins?: string[];
 }
 
 /** Schemastery schema consumed by Cordis/DSH plugin loaders. */
@@ -32,6 +49,10 @@ export const Config: z<Config> = z.object({
     .boolean()
     .default(false)
     .description('Bypass per-call caching of registry lookups.'),
+  trustedOrigins: z
+    .array(z.string())
+    .default([])
+    .description('Extra hostnames allowed to POST to the update endpoint (CSRF allow-list).'),
 });
 
 const KNOWN_DEPLOYMENT_ROOTS = [
@@ -70,6 +91,20 @@ const NODE_FETCH_SCRIPT = [
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Extract a bare hostname (no scheme/port/path) from a URL or Host header value. */
+function hostnameOf(value: string): string | null {
+  const v = value.trim();
+  if (!v) return null;
+  try {
+    // Origin/Referer are absolute URLs; Host is a bare authority.
+    const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(v) ? v : 'http://' + v;
+    const host = new URL(withScheme).hostname;
+    return host.replace(/^\[|\]$/g, '');
+  } catch {
+    return null;
+  }
 }
 
 function semverParts(s: string): { nums: number[]; pre: string[] } | null {
@@ -523,31 +558,32 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   const registerRoutes = () => {
     if (!webServer) return;
+    const trustedOrigins: string[] = Array.isArray(cfg.trustedOrigins)
+      ? cfg.trustedOrigins
+      : [];
     /**
      * Reject cross-origin write requests (CSRF guard). The write endpoint
      * triggers a global `npm install`, so no third-party page may invoke it.
-     * Same-origin browsers send an Origin/Referer that matches the request
-     * Host; requests without either (curl, same-page scripts) are allowed.
-     * Returns true when the request is permitted.
+     * A request is allowed when it carries no Origin/Referer (curl, same-page
+     * scripts, browsers that suppress the header), when the Origin matches the
+     * request Host (same-origin), when it is loopback, or when the Origin
+     * hostname is in the configured `trustedOrigins`. Anything else is a
+     * cross-origin attack and is rejected.
      */
     const isSameOrigin = (req: IncomingMessage): boolean => {
       const origin = req.headers.origin ?? req.headers.referer;
       if (!origin) return true;
       const host = req.headers.host;
-      if (!host) return false;
-      const allowed = ['127.0.0.1', 'localhost'].some(
-        (h) => host === h || host.startsWith(h + ':'),
-      );
-      let originHost: string;
-      try {
-        originHost = new URL(origin).host;
-      } catch {
-        return false;
+      const originHost = hostnameOf(origin);
+      if (originHost === null) return false;
+      const loopback = ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(originHost);
+      if (loopback) return true;
+      if (host) {
+        const hostName = hostnameOf(host);
+        if (hostName !== null && hostName === originHost) return true;
       }
-      // Trust the loopback origin outright; otherwise require it to equal the
-      // request Host (same-origin write).
-      const originMatch = originHost === host || originHost.replace(/:\d+$/, '') === host.replace(/:\d+$/, '');
-      return allowed || originMatch;
+      if (trustedOrigins.includes(originHost)) return true;
+      return false;
     };
 
     const rejectForbidden = (req: IncomingMessage, res: ServerResponse) => {

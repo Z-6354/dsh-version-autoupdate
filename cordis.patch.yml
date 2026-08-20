@@ -10,3 +10,5 @@
       config:
         packageManager: auto
         force: false
+        # reverse-proxied public origins allowed to trigger updates
+        trustedOrigins: [dsh.wannian.fun, wannian.fun, www.wannian.fun]
