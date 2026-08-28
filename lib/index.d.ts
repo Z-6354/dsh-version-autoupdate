@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
+import { type UpdatePolicy } from './platform-policy.js';
 /**
  * Cordis plugin name used by the DSH Loader / cordis.yml.
  *
@@ -11,6 +12,7 @@ import z from '@deepseek-ai/schemastery';
  *  - an npm install -g update routine with live progress tail.
  */
 export declare const name = "dsh-version-autoupdate";
+export { versionCompare } from './semver.js';
 /**
  * Services the host half depends on. Declaring `inject` tells DSH/Cordis to
  * activate this plugin only once these are ready and to expose them on the
@@ -23,8 +25,15 @@ export declare const inject: string[];
 /** Package description shown by the DSH plugin inventory. */
 export type Channel = 'stable' | 'preview';
 export interface Config {
-    /** Package manager used to update DSH. Defaults to discovering npm/pnpm/yarn. */
+    /** Package manager used to update DSH. Defaults to npm from the running dsh Node install. */
     packageManager?: 'npm' | 'pnpm' | 'yarn' | 'auto';
+    /**
+     * Absolute path to the package manager executable (e.g. /home/ubuntu/.local/node-v22.19.0/bin/npm).
+     * When set, overrides PATH discovery entirely.
+     */
+    packageManagerPath?: string;
+    /** Block npm update when Linux MemAvailable is below this many MB. Set 0 to disable. */
+    minAvailableMemoryMb?: number;
     /** Regenerate everything from the registry on status even after a cache hit. */
     force?: boolean;
     /**
@@ -44,13 +53,32 @@ export interface Config {
      * allowed. Only the bare hostname is compared.
      */
     trustedOrigins?: string[];
-    /**
-     * After a successful update, spawn a detached helper and exit so the web
-     * process reloads the new build. Default true.
-     */
+    /** Linux/macOS: auto-restart after install (default off; use step ③ button instead). */
     autoRestart?: boolean;
-    /** Delay before process.exit so the UI can show “restarting…”. Default 2000. */
+    /** Delay before process.exit during auto-restart (ms). */
     restartDelayMs?: number;
+    /** Max wait for global install subprocess (ms). Default 20 min. */
+    installTimeoutMs?: number;
+    /** Kill install when no stdout/stderr for this long (ms). Default 0 = disabled (npm often silent while fetching). */
+    installIdleTimeoutMs?: number;
+    /** Grace period after SIGTERM before force-kill (ms). */
+    installGraceMs?: number;
+    /**
+     * Low-memory VPS install strategy.
+     *  - 'auto' (default): Linux with MemTotal <= offlineInstallMaxMemMb → stop DSH, npm in background, restart
+     *  - 'always' | 'never'
+     */
+    offlineInstall?: 'auto' | 'always' | 'never';
+    /** MemTotal threshold (MB) for auto offline install. Default 2560 (2G class VPS). */
+    offlineInstallMaxMemMb?: number;
+    /** systemd unit to stop/start around offline install (default dsh-web.service). */
+    systemdUnit?: string;
+    /**
+     * Update capability policy.
+     *  - 'platform' (default): Windows → install+restart; Linux/macOS → detect-only
+     *  - 'full' | 'detect-only'
+     */
+    updatePolicy?: UpdatePolicy;
 }
 /** Schemastery schema consumed by Cordis/DSH plugin loaders. */
 export declare const Config: z<Config>;
@@ -69,31 +97,8 @@ export interface DshVersionInfo {
     note?: string;
     status: 'up-to-date' | 'update-available' | 'update-done-restart' | 'unknown';
 }
-export interface UpdateState {
-    running: boolean;
-    phase: 'idle' | 'detect' | 'installing' | 'done' | 'error';
-    done: boolean;
-    ok: boolean;
-    message: string;
-    tail: string;
-    /** 0–100 estimated progress for the UI progress bar. */
-    progress: number;
-    /** Short human-readable step label. */
-    progressLabel: string;
-    /** Epoch ms when the current update started. */
-    startedAt: number | null;
-    system: {
-        os: string;
-        arch: string;
-        node: string;
-        installMethod: string;
-    } | null;
-    before: string | null;
-    after: string | null;
-    latest: string | null;
-    /** True once a restart helper has been spawned. */
-    restartScheduled?: boolean;
-}
+export type { UpdateState } from './update-types.js';
+export { estimateInstallProgress } from './update-progress.js';
 /** Registry-derived candidates. */
 export interface VersionCandidates {
     /** Highest version with no pre-release suffix. */
@@ -101,8 +106,6 @@ export interface VersionCandidates {
     /** Highest version overall (pre-releases included). */
     previewMax: string | null;
 }
-/** Minimal semver compare specialised for DSH versions (x.y.z and -rc.N). */
-export declare function versionCompare(a: string, b: string): number;
 /**
  * Install the plugin.
  *

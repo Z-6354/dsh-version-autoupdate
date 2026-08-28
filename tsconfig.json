@@ -13,5 +13,6 @@
     "verbatimModuleSyntax": true,
     "types": ["node"]
   },
-  "include": ["src/index.ts", "src/invariant.ts"]
+  "include": ["src/**/*.ts", "src/**/*.d.ts"],
+  "exclude": ["src/client/**", "src/client.tsx"]
 }

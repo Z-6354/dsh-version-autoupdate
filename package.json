@@ -1,16 +1,15 @@
 {
   "name": "dsh-version-autoupdate",
-  "version": "0.1.14",
-  "description": "DSH dual-surface Cordis plugin: a version badge with one-click auto-update for the DeepSeek Harness web UI.",
+  "version": "0.3.21",
+  "description": "Draggable floating version capsule (restored from 0.3.7) + one-click update.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "files": [
-    "lib/index.js",
-    "lib/index.d.ts",
-    "lib/invariant.js",
-    "lib/invariant.d.ts",
-    "lib/client.js",
+    "lib/**/*.js",
+    "lib/**/*.d.ts",
+    "lib/dsh-restart.mjs",
+    "lib/offline-install.mjs",
     "lib/client.js.map",
     "cordis.patch.yml",
     "src/client.tsx"
@@ -39,16 +38,16 @@
       "platform": "web",
       "inject": [
         "@deepseek-ai/dsh-client-runtime",
-        "@deepseek-ai/dsh-client-locale"
+        "@deepseek-ai/dsh-client-ui-layout"
       ]
     }
   },
   "scripts": {
     "clean": "rm -rf lib",
     "build:client": "node scripts/build-client.mjs",
-    "build": "npm run build:client && tsc -p tsconfig.json",
+    "build": "npm run build:client && tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.copyFileSync('src/dsh-restart.mjs','lib/dsh-restart.mjs');fs.copyFileSync('src/offline-install.mjs','lib/offline-install.mjs')\"",
     "prepack": "node -e \"process.exit(0)\"",
-    "test": "npm run build"
+    "test": "npm run build && node --test tests/*.spec.mjs"
   },
   "keywords": [
     "dsh",
@@ -76,5 +75,10 @@
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/dsh-host-webserver": "^0.1.0-rc.8",
     "@deepseek-ai/dsh-client-runtime": "^0.1.0-rc.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.8.0"
   }
 }

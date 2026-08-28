@@ -11,7 +11,7 @@ DSH (DeepSeek Harness) 双面 Cordis 插件：在 Web UI 中显示 DSH 版本角
   - `preview`（默认）：最高版本，含预发布/rc（如 `0.1.0-rc.8`、未来 `0.6.0-rc.N`）；
   - `stable`：只认不带预发布后缀的最高正式版；若暂无正式版则自动回退到 preview。
   - 面板会同时显示「预览最新 / 稳定最新 / 目标版本（按当前通道）」。
-- **一键更新**：可更新时点击角标 → 面板 → 「⚡ 立即更新」，检测系统与安装方式 → `npm install -g @deepseek-ai/dsh@<target>`（npm 不可用时回退 pnpm/yarn）→ 显示实时进度 → 「更新完成 · 重启生效」。
+- **一键更新**：可更新时点击角标 → 面板 → 「⚡ 立即更新」，使用**与当前 dsh 同 Node 目录的 npm**（不再误用 PATH 里的 Cursor/旧 Node）执行 `npm install -g @deepseek-ai/dsh@<target>` → 显示实时进度 → 「更新完成 · 重启生效」。默认安装超时 **10 分钟**（`installTimeoutMs`，小型 VPS 可调大）。内存不足（Linux MemAvailable < 400MB）时会拒绝安装，避免半装损坏。
 - **只读探测**：拉取仅通过 `subprocess` + `web` 服务的只读链路；更新由用户点按钮触发，不静默后台安装。
 - **点击外部关闭**：面板在点击任意非角标区域后自动关闭（无 × 按钮）。
 
@@ -43,6 +43,48 @@ npm i -g dsh-version-autoupdate
 3. 当显示「可更新」时点击角标 → 面板 → 「⚡ 立即更新」，等待完成。
 4. 完成后提示**重启 `dsh web` 进程**使新版本生效（运行中的进程无法安全自重启）。
 5. 想切换更新通道（预览/稳定）在 DSH 插件配置里把 `channel` 改为 `preview` 或 `stable` 后重启即可。
+
+## 配置（cordis.yml / cordis.patch.yml）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `packageManager` | `npm` | 固定用 npm；也可 `pnpm` / `yarn` / `auto` |
+| `packageManagerPath` | — | **推荐在 2G VPS 上显式指定**，如 `/home/ubuntu/.local/node-v22.19.0/bin/npm` |
+| `minAvailableMemoryMb` | `400` | Linux 可用内存低于此值时拒绝更新（`0` 关闭） |
+| `installTimeoutMs` | `600000` | 全局安装最长等待时间（毫秒），默认 10 分钟；慢速 VPS 可调到 `900000`（15 分钟） |
+| `installGraceMs` | `60000` | 超时后 SIGTERM 的宽限期（毫秒） |
+| `channel` | `preview` | `stable` 只追正式版 |
+
+```yaml
+- id: dsh-version-autoupdate
+  name: dsh-version-autoupdate
+  config:
+    packageManager: npm
+    packageManagerPath: /home/ubuntu/.local/node-v22.19.0/bin/npm
+    minAvailableMemoryMb: 400
+    installTimeoutMs: 900000   # 15 min on slow 2G VPS
+```
+
+## 更新超时
+
+若面板显示「更新超时（600 秒）」且 npm 日志仍在 `http fetch`，说明安装未失败，只是超过了默认等待时间。可：
+
+1. 在插件配置中增大 `installTimeoutMs`（如 `900000`）后重启 `dsh web` 再试；
+2. 或 SSH 到服务器手动执行（使用**与 dsh 同 Node 的 npm 绝对路径**）：
+
+```bash
+/home/ubuntu/.local/node-v22.19.0/bin/npm install -g @deepseek-ai/dsh@0.1.0-rc.8 --no-audit --no-fund --omit=optional
+```
+
+超时**不等于** dsh 已损坏；只有安装命令非零退出且 `dsh` 无法启动时才需要回滚到旧版本。
+
+若 `npm install -g` 中途被 OOM 杀死，`dsh` 可能每 5 秒崩溃重启。在控制台 VNC 登录后执行：
+
+```bash
+/home/ubuntu/.local/node-v22.19.0/bin/npm install -g @deepseek-ai/dsh@<上一个正常版本>
+# 或
+npm install -g @deepseek-ai/dsh@latest   # 确认 which npm 指向正确 Node
+```
 
 ## 开发
 

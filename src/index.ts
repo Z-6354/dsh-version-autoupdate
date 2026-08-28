@@ -1,6 +1,35 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Context } from '@deepseek-ai/cordis';
+import { findDshRoot } from './dsh-root.js';
 import z from '@deepseek-ai/schemastery';
+import {
+  buildGlobalInstallArgv,
+  buildInstallEnv,
+  lowMemoryInstallWarning,
+  packageManagerSearchPaths,
+  runningNodeSatisfiesDsh,
+} from './package-manager.js';
+import { isNewer, semverParts, versionCompare } from './semver.js';
+import { estimateInstallProgress } from './update-progress.js';
+import type { UpdateState, UpdateStep } from './update-types.js';
+import { STEP_LABELS } from './update-types.js';
+import {
+  autoRestartEnabled,
+  isRestartScheduled,
+  manualRestartHint,
+  scheduleProcessRestart,
+} from './dsh-restart.mjs';
+import {
+  readLinuxMemTotalMb,
+  readOfflineState,
+  scheduleOfflineInstall,
+  shouldUseOfflineInstall,
+  offlineLogFile,
+} from './offline-install.mjs';
+import { resolveUpdateCapabilities, type UpdatePolicy, type UpdateCapabilities } from './platform-policy.js';
 
 /**
  * Cordis plugin name used by the DSH Loader / cordis.yml.
@@ -13,6 +42,8 @@ import z from '@deepseek-ai/schemastery';
  *  - an npm install -g update routine with live progress tail.
  */
 export const name = 'dsh-version-autoupdate';
+
+export { versionCompare } from './semver.js';
 
 /**
  * Services the host half depends on. Declaring `inject` tells DSH/Cordis to
@@ -28,8 +59,15 @@ export const inject = ['webServer', 'subprocess', 'fs', 'sandboxPolicy', 'timer'
 export type Channel = 'stable' | 'preview';
 
 export interface Config {
-  /** Package manager used to update DSH. Defaults to discovering npm/pnpm/yarn. */
+  /** Package manager used to update DSH. Defaults to npm from the running dsh Node install. */
   packageManager?: 'npm' | 'pnpm' | 'yarn' | 'auto';
+  /**
+   * Absolute path to the package manager executable (e.g. /home/ubuntu/.local/node-v22.19.0/bin/npm).
+   * When set, overrides PATH discovery entirely.
+   */
+  packageManagerPath?: string;
+  /** Block npm update when Linux MemAvailable is below this many MB. Set 0 to disable. */
+  minAvailableMemoryMb?: number;
   /** Regenerate everything from the registry on status even after a cache hit. */
   force?: boolean;
   /**
@@ -49,31 +87,52 @@ export interface Config {
    * allowed. Only the bare hostname is compared.
    */
   trustedOrigins?: string[];
+  /** Linux/macOS: auto-restart after install (default off; use step ③ button instead). */
+  autoRestart?: boolean;
+  /** Delay before process.exit during auto-restart (ms). */
+  restartDelayMs?: number;
+  /** Max wait for global install subprocess (ms). Default 20 min. */
+  installTimeoutMs?: number;
+  /** Kill install when no stdout/stderr for this long (ms). Default 0 = disabled (npm often silent while fetching). */
+  installIdleTimeoutMs?: number;
+  /** Grace period after SIGTERM before force-kill (ms). */
+  installGraceMs?: number;
+  /**
+   * Low-memory VPS install strategy.
+   *  - 'auto' (default): Linux with MemTotal <= offlineInstallMaxMemMb → stop DSH, npm in background, restart
+   *  - 'always' | 'never'
+   */
+  offlineInstall?: 'auto' | 'always' | 'never';
+  /** MemTotal threshold (MB) for auto offline install. Default 2560 (2G class VPS). */
+  offlineInstallMaxMemMb?: number;
+  /** systemd unit to stop/start around offline install (default dsh-web.service). */
+  systemdUnit?: string;
+  /**
+   * Update capability policy.
+   *  - 'platform' (default): Windows → install+restart; Linux/macOS → detect-only
+   *  - 'full' | 'detect-only'
+   */
+  updatePolicy?: UpdatePolicy;
 }
 
 /** Schemastery schema consumed by Cordis/DSH plugin loaders. */
 export const Config: z<Config> = z.object({
-  packageManager: z
-    .union(['npm', 'pnpm', 'yarn', 'auto'])
-    .default('auto')
-    .description('Package manager used to auto-update DSH.'),
-  force: z
-    .boolean()
-    .default(false)
-    .description('Bypass per-call caching of registry lookups.'),
-  channel: z
-    .union(['stable', 'preview'])
-    .default('preview')
-    .description('Update target: preview (highest version incl. pre-release) or stable (highest release only).'),
-  trustedOrigins: z
-    .array(z.string())
-    .default([])
-    .description('Extra hostnames allowed to POST to the update endpoint (CSRF allow-list).'),
+  packageManager: z.union(['npm', 'pnpm', 'yarn', 'auto']).default('npm'),
+  packageManagerPath: z.string(),
+  minAvailableMemoryMb: z.number().default(400),
+  force: z.boolean().default(false),
+  channel: z.union(['stable', 'preview']).default('preview'),
+  trustedOrigins: z.array(z.string()).default([]),
+  autoRestart: z.boolean().default(false),
+  restartDelayMs: z.number().default(2000),
+  installTimeoutMs: z.number().default(1200000),
+  installIdleTimeoutMs: z.number().default(0),
+  installGraceMs: z.number().default(60000),
+  offlineInstall: z.union(['auto', 'always', 'never']).default('auto'),
+  offlineInstallMaxMemMb: z.number().default(2560),
+  systemdUnit: z.string().default('dsh-web.service'),
+  updatePolicy: z.union(['platform', 'full', 'detect-only']).default('platform'),
 });
-
-const KNOWN_DEPLOYMENT_ROOTS = [
-  '/home/ubuntu/.local/node-v22.19.0/lib/node_modules/@deepseek-ai/dsh',
-];
 
 export interface DshVersionInfo {
   runningVersion: string | null;
@@ -91,18 +150,8 @@ export interface DshVersionInfo {
   status: 'up-to-date' | 'update-available' | 'update-done-restart' | 'unknown';
 }
 
-export interface UpdateState {
-  running: boolean;
-  phase: 'idle' | 'detect' | 'installing' | 'done' | 'error';
-  done: boolean;
-  ok: boolean;
-  message: string;
-  tail: string;
-  system: { os: string; arch: string; node: string; installMethod: string } | null;
-  before: string | null;
-  after: string | null;
-  latest: string | null;
-}
+export type { UpdateState } from './update-types.js';
+export { estimateInstallProgress } from './update-progress.js';
 
 /** Registry-derived candidates. */
 export interface VersionCandidates {
@@ -112,18 +161,51 @@ export interface VersionCandidates {
   previewMax: string | null;
 }
 
-const NODE_INFO_SCRIPT =
-  'console.log(JSON.stringify({ platform: process.platform, arch: process.arch, node: process.version }));';
-
-const NODE_FETCH_SCRIPT = [
+const NODE_FETCH_SCRIPT = (pkg: string) => [
   '(async () => {',
-  "  const r = await fetch('https://registry.npmjs.org/@deepseek-ai/dsh', { signal: AbortSignal.timeout(20000), headers: { Accept: 'application/vnd.npm.install-v1+json' } });",
+  `  const r = await fetch('https://registry.npmjs.org/${pkg}', { signal: AbortSignal.timeout(20000), headers: { Accept: 'application/vnd.npm.install-v1+json' } });`,
   '  console.log(JSON.stringify({ status: r.status, body: await r.text() }));',
   '})().catch((e) => { console.log(JSON.stringify({ status: 0, body: String((e && e.message) || e) })); });',
 ].join('\n');
 
+const PLUGIN_PKG = 'dsh-version-autoupdate';
+const PLUGIN_INSTALLED_VERSION: string | null = (() => {
+  try {
+    const p = join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json');
+    const pkg = JSON.parse(readFileSync(p, 'utf8')) as { version?: string };
+    return typeof pkg.version === 'string' ? pkg.version : null;
+  } catch {
+    return null;
+  }
+})();
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+function enrichUpdateState(state: UpdateState, installTimeoutMs = 1_200_000): UpdateState {
+  const progress = estimateInstallProgress(state.phase, state.startedAt, state.tail, installTimeoutMs);
+  const restartScheduled = state.restartScheduled || isRestartScheduled();
+  let progressLabel = '';
+  if (state.phase === 'checking') progressLabel = STEP_LABELS.check;
+  else if (state.phase === 'check-done') progressLabel = '检查完成';
+  else if (state.phase === 'installing') progressLabel = STEP_LABELS.install;
+  else if (state.phase === 'install-done') progressLabel = '安装完成';
+  else if (state.phase === 'restarting') progressLabel = STEP_LABELS.restart;
+  else if (state.phase === 'done') progressLabel = '全部完成';
+  else if (state.phase === 'error') progressLabel = state.failedStep ? `${STEP_LABELS[state.failedStep as keyof typeof STEP_LABELS]} · 失败` : '失败';
+  return {
+    ...state,
+    progress,
+    progressLabel,
+    progressSpeed: '',
+    restartScheduled,
+  };
+}
+
+function stageError(step: UpdateStep, detail: string): string {
+  const label = step === 'idle' ? '准备' : STEP_LABELS[step as keyof typeof STEP_LABELS];
+  return `[${label}] ${detail}`;
 }
 
 /** Extract a bare hostname (no scheme/port/path) from a URL or Host header value. */
@@ -140,47 +222,14 @@ function hostnameOf(value: string): string | null {
   }
 }
 
-function semverParts(s: string): { nums: number[]; pre: string[] } | null {
-  if (typeof s !== 'string') return null;
-  const t = s.trim().replace(/^v/i, '');
-  const dash = t.indexOf('-');
-  const main = dash >= 0 ? t.slice(0, dash) : t;
-  const pre = dash >= 0 ? t.slice(dash + 1).split('.') : [];
-  const nums = main.split('.').map((x) => parseInt(x, 10));
-  if (nums.length === 0 || nums.some((x) => Number.isNaN(x))) return null;
-  return { nums, pre };
-}
-
-/** Minimal semver compare specialised for DSH versions (x.y.z and -rc.N). */
-export function versionCompare(a: string, b: string): number {
-  const x = semverParts(a);
-  const y = semverParts(b);
-  if (!x || !y) return a < b ? -1 : a > b ? 1 : 0;
-  const n = Math.max(x.nums.length, y.nums.length);
-  for (let i = 0; i < n; i++) {
-    const xv = x.nums[i] || 0;
-    const yv = y.nums[i] || 0;
-    if (xv !== yv) return xv < yv ? -1 : 1;
-  }
-  if (x.pre.length && !y.pre.length) return -1;
-  if (!x.pre.length && y.pre.length) return 1;
-  const m = Math.max(x.pre.length, y.pre.length);
-  for (let i = 0; i < m; i++) {
-    const xp = x.pre[i] || '';
-    const yp = y.pre[i] || '';
-    if (xp !== yp) return xp < yp ? -1 : 1;
-  }
-  return 0;
-}
-
-function isNewer(installed: string, latest: string): boolean {
-  return versionCompare(installed, latest) < 0;
-}
 
 interface CollectHandle {
   pid: number;
   done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>;
-  collected?: { stdout?: { readFrom(o: number): { text: string; nextOffset: number } } };
+  collected?: {
+    stdout?: { readFrom(o: number): { text: string; nextOffset: number } };
+    stderr?: { readFrom(o: number): { text: string; nextOffset: number } };
+  };
   terminate(): void;
 }
 
@@ -205,7 +254,7 @@ function candidatesFromVersions(versions: string[]): VersionCandidates {
 
 /** Wrap a fetch to npm registry. Prefers the host web service, falls back to a node subprocess. */
 async function fetchVersionCandidates(ctx: Context): Promise<VersionCandidates | null> {
-  const body = await fetchRegistryBody(ctx);
+  const body = await fetchRegistryBody(ctx, '@deepseek-ai/dsh');
   if (!body) return null;
   try {
     const pkg = JSON.parse(body) as { versions?: Record<string, unknown> };
@@ -216,15 +265,16 @@ async function fetchVersionCandidates(ctx: Context): Promise<VersionCandidates |
   }
 }
 
-/** Fetch the raw @deepseek-ai/dsh registry manifest, via web service then node subprocess. */
-async function fetchRegistryBody(ctx: Context): Promise<string | null> {
+/** Fetch the raw npm registry manifest, via web service then node subprocess. */
+async function fetchRegistryBody(ctx: Context, packageName = '@deepseek-ai/dsh'): Promise<string | null> {
+  const registryUrl = `https://registry.npmjs.org/${packageName}`;
   // 1. Prefer the web service if present.
   const webSvc = ctx.get('web') as
     | { fetch(req: { url: string }): Promise<{ statusCode: number; body: { kind: string; content: string } }> }
     | undefined;
   if (webSvc) {
     try {
-      const res = await webSvc.fetch({ url: 'https://registry.npmjs.org/@deepseek-ai/dsh' });
+      const res = await webSvc.fetch({ url: registryUrl });
       if (res && res.statusCode === 200 && typeof res.body?.content === 'string') {
         return res.body.content;
       }
@@ -250,20 +300,15 @@ async function fetchRegistryBody(ctx: Context): Promise<string | null> {
       }
     | undefined;
   if (!sub) return null;
-  let nodeExe = 'node';
-  try {
-    nodeExe = await sub.resolveExecutable('node');
-  } catch {
-    /* keep default */
-  }
+  const nodeExe = process.execPath;
   const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
   const cwd = sp?.workspaceRoot || '/tmp';
   let handle: CollectHandle | undefined;
   try {
     handle = sub.spawn({
-      argv: [nodeExe, '-e', NODE_FETCH_SCRIPT],
+      argv: [nodeExe, '-e', NODE_FETCH_SCRIPT(packageName)],
       cwd,
-      stdio: { stdin: 'ignore', stdout: { maxBytes: 131072 }, stderr: { maxBytes: 131072 } },
+      stdio: { stdin: 'ignore', stdout: { maxBytes: 1048576 }, stderr: { maxBytes: 131072 } },
       graceMs: 25000,
     });
   } catch {
@@ -283,46 +328,6 @@ async function fetchRegistryBody(ctx: Context): Promise<string | null> {
     return null;
   } finally {
     if (clearTimer) clearTimer();
-  }
-  return null;
-}
-
-/** Locate the installed DSH package root and read its installed package version. */
-async function findDshRoot(ctx: Context): Promise<string | null> {
-  const fsSvc = ctx.get('fs') as
-    | {
-        resolve(path: string): Promise<unknown>;
-        readText(target: unknown): Promise<string>;
-      }
-    | undefined;
-  if (!fsSvc) return null;
-  const roots: string[] = [];
-  const sub = ctx.get('subprocess') as { resolveExecutable(cmd: string): Promise<string> } | undefined;
-  if (sub) {
-    try {
-      const exe = await sub.resolveExecutable('dsh');
-      if (exe.endsWith('/bin/dsh')) {
-        roots.push(exe.slice(0, -'/bin/dsh'.length) + '/lib/node_modules/@deepseek-ai/dsh');
-      } else if (exe.endsWith('/lib/bin.js')) {
-        roots.push(exe.slice(0, -'/lib/bin.js'.length));
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  roots.push(...KNOWN_DEPLOYMENT_ROOTS);
-  for (const root of roots) {
-    if (!root) continue;
-    try {
-      const target = await fsSvc.resolve(root + '/package.json');
-      const text = await fsSvc.readText(target);
-      const pkg = JSON.parse(text) as { name?: string; version?: string };
-      if (pkg?.name === '@deepseek-ai/dsh' && typeof pkg.version === 'string' && pkg.version) {
-        return root;
-      }
-    } catch {
-      /* try next */
-    }
   }
   return null;
 }
@@ -383,24 +388,146 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   // Caches.
   let versionCache: { t: number; v: VersionCandidates | null } = { t: 0, v: null };
+  let moduleLatestCache: { t: number; v: string | null } = { t: 0, v: null };
   let installedCache: { t: number; v: string | null } = { t: 0, v: null };
   const runningPromise: Promise<string | null> = readInstalledVersion(ctx).catch(() => null);
 
+  const getModuleLatest = async (force = false): Promise<string | null> => {
+    const now = Date.now();
+    if (!force && moduleLatestCache.v !== null && now - moduleLatestCache.t < 120000) return moduleLatestCache.v;
+    const body = await fetchRegistryBody(ctx, PLUGIN_PKG);
+    let latest: string | null = null;
+    if (body) {
+      try {
+        const pkg = JSON.parse(body) as { versions?: Record<string, unknown> };
+        if (pkg?.versions) latest = maxVersion(Object.keys(pkg.versions), true);
+      } catch { /* ignore */ }
+    }
+    moduleLatestCache = { t: now, v: latest };
+    return latest;
+  };
+
   const channel: Channel = cfg.channel === 'stable' ? 'stable' : 'preview';
+  const capabilities = resolveUpdateCapabilities(process.platform, (cfg.updatePolicy ?? 'platform') as UpdatePolicy);
 
   // Update state machine.
   const updateState: UpdateState = {
     running: false,
     phase: 'idle',
+    step: 'idle',
+    failedStep: null,
     done: false,
     ok: false,
     message: '',
     tail: '',
+    progress: 0,
+    progressLabel: '',
+    progressSpeed: '',
+    startedAt: null,
+    restartScheduled: false,
     system: null,
     before: null,
     after: null,
     latest: null,
   };
+
+  function restoreOfflineState(): void {
+    const s = readOfflineState() as {
+      status?: string;
+      target?: string;
+      before?: string | null;
+      logFile?: string;
+      exitCode?: number;
+    } | null;
+    if (!s?.status) return;
+    const log = s.logFile || offlineLogFile();
+    updateState.before = s.before ?? updateState.before;
+    updateState.latest = s.target ?? updateState.latest;
+    if (s.status === 'running') {
+      updateState.phase = 'installing';
+      updateState.step = 'install';
+      updateState.message = `离线安装进行中（DSH 可能已短暂关闭）。SSH 查看：${log}`;
+      updateState.tail = `离线安装日志：${log}\n`;
+    } else if (s.status === 'done') {
+      updateState.phase = 'install-done';
+      updateState.step = 'install';
+      updateState.ok = true;
+      updateState.done = true;
+      updateState.message = `离线安装已完成（目标 v${s.target ?? '?'}）。请刷新页面；若运行版本未变可点 ③ 重启。日志：${log}`;
+    } else if (s.status === 'error') {
+      updateState.phase = 'error';
+      updateState.step = 'install';
+      updateState.failedStep = 'install';
+      updateState.ok = false;
+      updateState.done = true;
+      const restartHint = (s as { restartFailed?: boolean }).restartFailed
+        ? ' npm 已成功但未能自动拉起 DSH，请 SSH 执行：sudo systemctl start dsh-web.service'
+        : '';
+      updateState.message = `[② 安装到本地] 离线安装失败（exit ${s.exitCode ?? '?'}）${restartHint}，见 ${log}`;
+    }
+  }
+
+  function failStep(step: UpdateStep, detail: string, hint = ''): void {
+    updateState.phase = 'error';
+    updateState.step = step;
+    updateState.failedStep = step;
+    updateState.ok = false;
+    updateState.done = true;
+    updateState.running = false;
+    updateState.message = stageError(step, detail) + hint;
+  }
+
+  restoreOfflineState();
+
+  /** Keep wizard step ① in sync with automatic /status registry polling. */
+  function syncAutoCheckFromStatus(
+    installed: string | null,
+    latest: string | null,
+    system: NonNullable<UpdateState['system']>,
+  ): void {
+    if (updateState.running) return;
+    if (updateState.phase === 'installing' || updateState.phase === 'install-done' || updateState.phase === 'restarting') {
+      return;
+    }
+    if (updateState.phase === 'error' && updateState.failedStep && updateState.failedStep !== 'check') {
+      return;
+    }
+
+    updateState.system = system;
+    updateState.before = installed;
+    updateState.latest = latest;
+
+    if (!latest) {
+      if (updateState.phase === 'idle' || (updateState.phase === 'error' && updateState.failedStep === 'check')) {
+        updateState.phase = 'error';
+        updateState.step = 'check';
+        updateState.failedStep = 'check';
+        updateState.ok = false;
+        updateState.done = true;
+        updateState.message = stageError('check', '无法连接 npm registry，请检查网络');
+      }
+      return;
+    }
+
+    if (installed && !isNewer(installed, latest)) {
+      updateState.phase = 'idle';
+      updateState.step = 'idle';
+      updateState.failedStep = null;
+      updateState.ok = true;
+      updateState.done = false;
+      updateState.message = '';
+      return;
+    }
+
+    updateState.phase = 'check-done';
+    updateState.step = 'check';
+    updateState.failedStep = null;
+    updateState.ok = true;
+    updateState.done = true;
+    updateState.message = installed
+      ? `已检测到新版本 v${latest}（当前 v${installed}）`
+      : `已检测到版本 v${latest}`;
+  }
 
   const getCandidates = async (force = false): Promise<VersionCandidates | null> => {
     const now = Date.now();
@@ -428,63 +555,91 @@ export function apply(ctx: Context, config: Config = {}): void {
     return v;
   };
 
-  async function detectSystem(): Promise<NonNullable<UpdateState['system']>> {
-    const sys = { os: 'unknown', arch: 'unknown', node: '', installMethod: 'unknown' };
-    const sub = ctx.get('subprocess') as
-      | { resolveExecutable(cmd: string): Promise<string>; spawn(spec: unknown): CollectHandle }
-      | undefined;
-    if (sub) {
-      try {
-        const nodeExe = await sub.resolveExecutable('node').catch(() => 'node');
-        const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
-        const cwd = sp?.workspaceRoot || '/tmp';
-        const handle = sub.spawn({
-          argv: [nodeExe, '-e', NODE_INFO_SCRIPT],
-          cwd,
-          stdio: { stdin: 'ignore', stdout: { maxBytes: 131072 }, stderr: { maxBytes: 131072 } },
-          graceMs: 10000,
-        } as never);
-        const outcome = await handle.done;
-        if (outcome.exitCode === 0) {
-          const text = handle.collected?.stdout?.readFrom(0).text ?? '';
-          const d = JSON.parse(text.trim()) as { platform?: string; arch?: string; node?: string };
-          if (d.platform) sys.os = d.platform;
-          if (d.arch) sys.arch = d.arch;
-          if (d.node) sys.node = d.node;
-        }
-      } catch {
-        /* keep defaults */
-      }
-    }
-    const root = await findDshRoot(ctx);
-    if (root) sys.installMethod = root.includes('/node_modules/') ? 'npm' : 'git';
+  async function detectSystem(dshRoot: string | null, packageManager?: string): Promise<NonNullable<UpdateState['system']>> {
+    const sys = {
+      os: process.platform,
+      arch: process.arch,
+      node: process.version,
+      installMethod: 'unknown' as string,
+      packageManager,
+    };
+    if (dshRoot) sys.installMethod = dshRoot.includes('/node_modules/') ? 'npm' : 'git';
     return sys;
   }
 
-  async function resolvePackageManager(): Promise<string | null> {
-    const sub = ctx.get('subprocess') as { resolveExecutable(cmd: string): Promise<string> } | undefined;
+  async function readLinuxMemAvailableMb(): Promise<number | null> {
+    if (process.platform !== 'linux') return null;
+    const fsSvc = ctx.get('fs') as
+      | { resolve(path: string): Promise<unknown>; readText(target: unknown): Promise<string> }
+      | undefined;
+    if (!fsSvc) return null;
+    try {
+      const target = await fsSvc.resolve('/proc/meminfo');
+      const text = await fsSvc.readText(target);
+      const m = text.match(/MemAvailable:\s+(\d+)\s+kB/i);
+      if (!m) return null;
+      return Math.round(parseInt(m[1]!, 10) / 1024);
+    } catch {
+      return null;
+    }
+  }
+
+  async function resolvePackageManager(dshRoot: string | null): Promise<string | null> {
+    const sub = ctx.get('subprocess') as
+      | { resolveExecutable(cmd: string, env?: Readonly<Record<string, string>>): Promise<string> }
+      | undefined;
     if (!sub) return null;
+
+    const installEnv = buildInstallEnv();
+    const nodeBinDir = dirname(process.execPath);
+
+    if (cfg.packageManagerPath && cfg.packageManagerPath.trim()) {
+      try {
+        return await sub.resolveExecutable(cfg.packageManagerPath);
+      } catch {
+        return null;
+      }
+    }
+
     const wanted = cfg.packageManager === 'auto' ? ['npm', 'pnpm', 'yarn'] : [cfg.packageManager!];
     for (const name of wanted) {
+      for (const candidate of packageManagerSearchPaths({
+        dshRoot,
+        pm: name,
+        nodeBinDir,
+        platform: process.platform,
+      })) {
+        try {
+          return await sub.resolveExecutable(candidate);
+        } catch {
+          /* try next candidate */
+        }
+      }
       try {
-        return await sub.resolveExecutable(name);
+        return await sub.resolveExecutable(name, installEnv as Readonly<Record<string, string>>);
       } catch {
-        /* try next */
+        /* try next package manager */
       }
     }
     return null;
   }
 
-  async function runInstall(pmExe: string, version: string): Promise<void> {
+  async function runCaptured(
+    argv: string[],
+    cwd: string,
+    timeoutMs: number,
+    opts: { idleMs?: number; graceMs?: number } = {},
+  ): Promise<void> {
     const sub = ctx.get('subprocess') as { spawn(spec: Record<string, unknown>): CollectHandle } | undefined;
     if (!sub) throw new Error('subprocess service unavailable');
-    const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
-    const cwd = sp?.workspaceRoot || '/tmp';
+    const installGraceMs = Math.max(5_000, opts.graceMs ?? cfg.installGraceMs ?? 60_000);
+    const collect = (maxBytes: number) => ({ maxBytes, spill: { maxBytes: 32 * 1024 * 1024 } });
     const handle = sub.spawn({
-      argv: [pmExe, 'install', '-g', '@deepseek-ai/dsh@' + version, '--no-audit', '--no-fund', '--loglevel=info'],
+      argv,
       cwd,
-      stdio: { stdin: 'ignore', stdout: { maxBytes: 131072 }, stderr: { maxBytes: 131072 } },
-      graceMs: 20000,
+      env: buildInstallEnv(),
+      stdio: { stdin: 'ignore', stdout: collect(524288), stderr: collect(4 * 1024 * 1024) },
+      graceMs: installGraceMs,
     });
 
     const timer = ctx.get('timer') as
@@ -492,10 +647,30 @@ export function apply(ctx: Context, config: Config = {}): void {
       | undefined;
     let offsetOut = 0;
     let offsetErr = 0;
+    let clearIdle: (() => void) | undefined;
+    let timedOut = false;
+    let timedOutIdle = false;
+    const idleMs = typeof opts.idleMs === 'number' && opts.idleMs > 0 ? opts.idleMs : 0;
+
+    const bumpIdle = () => {
+      if (!timer || !idleMs) return;
+      if (clearIdle) clearIdle();
+      clearIdle = timer.timeout(() => {
+        timedOut = true;
+        timedOutIdle = true;
+        try { handle.terminate(); } catch { /* ignore */ }
+      }, idleMs);
+    };
+
     const appendTail = (text: string) => {
       if (!text) return;
-      updateState.tail = (updateState.tail + text).slice(-1200);
+      updateState.tail = (updateState.tail + text).slice(-6000);
+      bumpIdle();
     };
+
+    let lastTailLen = 0;
+    let lastOutputAt = Date.now();
+
     const poll = () => {
       try {
         const ro = handle.collected?.stdout?.readFrom(offsetOut);
@@ -503,107 +678,276 @@ export function apply(ctx: Context, config: Config = {}): void {
           offsetOut = ro.nextOffset;
           appendTail(ro.text);
         }
-        const re = handle.collected?.stdout?.readFrom(offsetErr);
+        const re = handle.collected?.stderr?.readFrom(offsetErr);
         if (re && re.text) {
           offsetErr = re.nextOffset;
           appendTail(re.text);
         }
-      } catch {
-        /* ignore read races */
-      }
+        const tailLen = updateState.tail.length;
+        if (tailLen !== lastTailLen) {
+          lastTailLen = tailLen;
+          lastOutputAt = Date.now();
+        } else if (updateState.phase === 'installing' && Date.now() - lastOutputAt > 60_000) {
+          const elapsed = Math.round((Date.now() - (updateState.startedAt ?? Date.now())) / 1000);
+          updateState.message = `npm 仍在运行（已 ${elapsed}s，可能正在下载/解压依赖，请耐心等待）`;
+          lastOutputAt = Date.now();
+        }
+      } catch { /* ignore read races */ }
     };
 
     let clearPoll: (() => void) | undefined;
     let clearTimeout: (() => void) | undefined;
-    let timedOut = false;
     if (timer) {
       clearPoll = timer.interval(poll, 250);
+      bumpIdle();
       clearTimeout = timer.timeout(() => {
         timedOut = true;
-        try {
-          handle.terminate();
-        } catch {
-          /* ignore */
-        }
-      }, 180000);
+        timedOutIdle = false;
+        try { handle.terminate(); } catch { /* ignore */ }
+      }, timeoutMs);
     }
+
     try {
       const outcome = await handle.done;
-      if (timedOut) throw new Error('\u66f4\u65b0\u8d85\u65f6\uff08180 \u79d2\uff09\uff0c\u5df2\u7ec8\u6b62');
       poll();
+      if (timedOut) {
+        const timeoutSec = Math.round(timeoutMs / 1000);
+        const idleSec = idleMs ? Math.round(idleMs / 1000) : 0;
+        if (timedOutIdle && idleSec) {
+          throw new Error(`[② 安装到本地] 安装超时（${idleSec} 秒无输出）。npm 下载大包时可能长时间无日志，建议将 installIdleTimeoutMs 设为 0 关闭空闲超时。`);
+        }
+        throw new Error(`[② 安装到本地] 安装超时（${timeoutSec} 秒）。可增大 installTimeoutMs 或 SSH 手动安装。`);
+      }
       if (outcome.exitCode !== 0) {
         const tail = updateState.tail.split('\n').filter(Boolean).slice(-4).join('\n').slice(0, 500);
         throw new Error('\u5b89\u88c5\u547d\u4ee4\u9000\u51fa\u7801 ' + outcome.exitCode + (tail ? '\uff1a' + tail : ''));
       }
     } finally {
       if (clearPoll) clearPoll();
+      if (clearIdle) clearIdle();
       if (clearTimeout) clearTimeout();
     }
   }
 
-  async function runUpdate(): Promise<void> {
+  async function runInstall(pmExe: string, version: string): Promise<void> {
+    const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
+    const cwd = sp?.workspaceRoot || '/tmp';
+    const installTimeoutMs = Math.max(60_000, cfg.installTimeoutMs ?? 1_200_000);
+    // Default 0: npm often has multi-minute silent phases; 300s idle kill was aborting real installs.
+    const installIdleTimeoutMs = Math.max(0, cfg.installIdleTimeoutMs ?? 0);
+    await runCaptured(
+      buildGlobalInstallArgv(pmExe, version),
+      cwd,
+      installTimeoutMs,
+      { idleMs: installIdleTimeoutMs, graceMs: cfg.installGraceMs },
+    );
+  }
+
+  async function runCheckStep(): Promise<void> {
+    updateState.phase = 'checking';
+    updateState.step = 'check';
+    updateState.failedStep = null;
+    updateState.tail = '';
+    updateState.message = '正在连接 npm registry…';
+    updateState.startedAt = Date.now();
+
+    const dshRoot = await findDshRoot(ctx);
+    const nodeCheck = runningNodeSatisfiesDsh();
+    if (!nodeCheck.ok) {
+      failStep('check', nodeCheck.message);
+      return;
+    }
+
+    const memThreshold = cfg.minAvailableMemoryMb ?? 400;
+    if (memThreshold > 0) {
+      const availableMb = await readLinuxMemAvailableMb();
+      const memWarn = lowMemoryInstallWarning(availableMb, memThreshold);
+      if (memWarn) {
+        failStep('check', memWarn);
+        return;
+      }
+    }
+
+    const pm = await resolvePackageManager(dshRoot);
+    const system = await detectSystem(dshRoot, pm ?? undefined);
+    updateState.system = system;
+    systemInfoCache = system;
+
+    if (system.installMethod === 'git') {
+      failStep('check', '检测到 git 源码安装，请手动 git pull 后执行步骤 ③ 重启');
+      return;
+    }
+
+    const before = await getInstalled();
+    updateState.before = before;
+
+    let cands: VersionCandidates | null;
     try {
-      updateState.phase = 'detect';
-      const system = await detectSystem();
-      updateState.system = system;
-      const before = await getInstalled();
-      updateState.before = before;
-      const cands = await getCandidates(true);
-      const { version: latest, note } = resolveTarget(cands);
-      updateState.latest = latest;
-      if (!latest) {
-        updateState.phase = 'error';
-        updateState.ok = false;
-        updateState.done = true;
-        updateState.running = false;
-        updateState.message = '\u65e0\u6cd5\u83b7\u53d6\u6700\u65b0\u7248\u672c\uff08\u7f51\u7edc\u6216\u89e3\u6790\u5931\u8d25\uff09\uff0c\u672a\u6267\u884c\u66f4\u65b0';
-        return;
-      }
-      if (before && !isNewer(before, latest)) {
-        updateState.phase = 'done';
-        updateState.ok = true;
-        updateState.after = before;
-        updateState.message = '\u5df2\u7ecf\u662f\u6700\u65b0\u7248\u672c v' + before + '\uff0c\u65e0\u9700\u66f4\u65b0';
-        return;
-      }
-      const pm = await resolvePackageManager();
-      if (!pm) {
-        updateState.phase = 'error';
-        updateState.ok = false;
-        updateState.done = true;
-        updateState.running = false;
-        updateState.message = '\u672a\u627e\u5230 npm/pnpm/yarn \u5305\u7ba1\u7406\u5668\uff0c\u65e0\u6cd5\u81ea\u52a8\u66f4\u65b0';
-        return;
-      }
-      if (system.installMethod === 'git') {
-        updateState.phase = 'error';
-        updateState.ok = false;
-        updateState.done = true;
-        updateState.running = false;
-        updateState.message = '\u68c0\u6d4b\u4e3a git \u6e90\u7801\u5b89\u88c5\uff0c\u8bf7\u624b\u52a8\u6267\u884c git pull \u66f4\u65b0';
-        return;
-      }
+      cands = await getCandidates(true);
+    } catch (e) {
+      failStep('check', '无法连接 npm registry 或解析版本列表', `（${errMsg(e)}）`);
+      return;
+    }
+
+    const { version: latest } = resolveTarget(cands);
+    updateState.latest = latest;
+    if (!latest) {
+      failStep('check', 'registry 未返回可用版本，请检查网络或 registry.npmjs.org 可达性');
+      return;
+    }
+
+    updateState.tail = `registry 最新: v${latest}\n当前已装: ${before ? 'v' + before : '未知'}\n`;
+
+    if (before && !isNewer(before, latest)) {
+      updateState.phase = 'check-done';
+      updateState.step = 'check';
+      updateState.ok = true;
+      updateState.done = true;
+      updateState.running = false;
+      updateState.after = before;
+      updateState.message = `已是最新版本 v${before}，无需安装`;
+      return;
+    }
+
+    if (!pm) {
+      failStep('check', '未找到 npm/pnpm/yarn，无法执行步骤 ②。可在配置中设置 packageManagerPath');
+      return;
+    }
+
+    updateState.phase = 'check-done';
+    updateState.step = 'check';
+    updateState.ok = true;
+    updateState.done = true;
+    updateState.running = false;
+    updateState.message = before
+      ? capabilities.canInstall
+        ? `检查完成：v${before} → v${latest}。请点击安装`
+        : `检测到新版本 v${latest}（当前 v${before}）。${capabilities.detectOnlyReason}`
+      : capabilities.canInstall
+        ? `检查完成：将安装 v${latest}。请点击安装`
+        : `检测到版本 v${latest}。${capabilities.detectOnlyReason}`;
+  }
+
+  async function runInstallStep(): Promise<void> {
+    if (!capabilities.canInstall) {
+      failStep('install', capabilities.detectOnlyReason || '此环境仅支持版本检测');
+      return;
+    }
+    if (updateState.phase !== 'check-done' || !updateState.latest) {
+      failStep('install', '请先完成步骤 ① 检查更新');
+      return;
+    }
+
+    const latest = updateState.latest;
+    const before = updateState.before;
+    const dshRoot = await findDshRoot(ctx);
+    const pmResolved = await resolvePackageManager(dshRoot);
+    if (!pmResolved) {
+      failStep('install', '未找到包管理器，无法安装');
+      return;
+    }
+
+    updateState.phase = 'installing';
+    updateState.step = 'install';
+    updateState.failedStep = null;
+    updateState.ok = false;
+    updateState.done = false;
+    updateState.startedAt = Date.now();
+    updateState.tail = `使用 ${pmResolved} (Node ${process.version})\n目标: @deepseek-ai/dsh@${latest}\n`;
+
+    const memTotalMb = readLinuxMemTotalMb();
+    if (shouldUseOfflineInstall(cfg as Record<string, unknown>, memTotalMb)) {
+      const npmArgv = buildGlobalInstallArgv(pmResolved, latest);
+      const r = scheduleOfflineInstall({
+        pmExe: pmResolved,
+        npmArgv,
+        version: latest,
+        before,
+        cfg: cfg as Record<string, unknown>,
+        dshPid: process.pid,
+      });
       updateState.phase = 'installing';
-      updateState.tail = '';
-      await runInstall(pm, latest);
+      updateState.tail += `离线模式（内存约 ${memTotalMb ?? '?'}MB）：先停 DSH → npm install → 再启动\n日志：${r.logFile}\n`;
+      updateState.message = r.message || '离线安装已启动';
+      updateState.running = false;
+      updateState.done = false;
+      return;
+    }
+
+    try {
+      await runInstall(pmResolved, latest);
       installedCache = { t: 0, v: null };
       const after = await getInstalled();
       updateState.after = after;
-      updateState.phase = 'done';
+      if (!after) {
+        failStep('install', '安装命令已结束，但无法读取已安装的 DSH 版本（可能 OOM 或全局路径损坏）');
+        return;
+      }
+      if (versionCompare(after, latest) < 0) {
+        failStep(
+          'install',
+          `安装后版本仍为 v${after}，未达到目标 v${latest}。可能安装被 OOM 中断或 npm 未完成，请 SSH 手动执行全局安装`,
+        );
+        return;
+      }
+      updateState.phase = 'install-done';
+      updateState.step = 'install';
       updateState.ok = true;
-      updateState.message = after
-        ? '\u66f4\u65b0\u5b8c\u6210\uff1a' + (before ? 'v' + before + ' \u2192 ' : '') + 'v' + after + '\u3002\u8bf7\u91cd\u542f dsh web \u670d\u52a1\u540e\u751f\u6548\u3002'
-        : '\u66f4\u65b0\u547d\u4ee4\u6267\u884c\u6210\u529f\uff0c\u8bf7\u91cd\u542f dsh \u670d\u52a1\u540e\u786e\u8ba4\u7248\u672c\u3002';
-    } catch (e) {
-      updateState.phase = 'error';
-      updateState.ok = false;
-      updateState.message = errMsg(e);
       updateState.done = true;
       updateState.running = false;
+      updateState.message = after
+        ? `安装完成：${before ? 'v' + before + ' → ' : ''}v${after}。请点击「③ 确认重启」加载新版本`
+        : '安装命令执行成功。请点击「③ 确认重启」';
+    } catch (e) {
+      const base = errMsg(e);
+      const pm = updateState.system?.packageManager ?? 'npm';
+      const isTimeout = /超时/.test(base);
+      let hint = '';
+      if (isTimeout) {
+        hint = ` 可 SSH 手动执行：${pm} install -g @deepseek-ai/dsh@${latest} --no-audit --no-fund --omit=optional`;
+      } else if (before) {
+        hint = ` 若 dsh 损坏可回滚：${pm} install -g @deepseek-ai/dsh@${before}`;
+      }
+      failStep('install', base.replace(/^\[② 安装到本地\] /, ''), hint);
     }
   }
 
-  async function statusPayload(force = false): Promise<DshVersionInfo & { update: UpdateState; system: UpdateState['system'] }> {
+
+  let systemInfoCache: UpdateState['system'] = null;
+  let systemInfoPromise: Promise<UpdateState['system']> | null = null;
+
+  async function getSystemInfo(): Promise<UpdateState['system']> {
+    if (updateState.system) return updateState.system;
+    if (systemInfoCache) return systemInfoCache;
+    if (!systemInfoPromise) {
+      systemInfoPromise = (async () => {
+        const dshRoot = await findDshRoot(ctx);
+        const pm = await resolvePackageManager(dshRoot);
+        const sys = await detectSystem(dshRoot, pm ?? undefined);
+        systemInfoCache = sys;
+        return sys;
+      })();
+    }
+    return systemInfoPromise;
+  }
+
+  async function statusPayload(force = false): Promise<
+    DshVersionInfo & {
+      update: UpdateState;
+      system: UpdateState['system'];
+      platform: string;
+      hostMemTotalMb: number | null;
+      offlineInstallRecommended: boolean;
+      offlineInstallLog: string;
+      autoRestart: boolean;
+      restartHint: string;
+      capabilities: UpdateCapabilities;
+      moduleName: string;
+      moduleVersion: string | null;
+      moduleLatestVersion: string | null;
+      moduleUpdateAvailable: boolean;
+    }
+  > {
     let running: string | null = null;
     let installed: string | null = null;
     let cands: VersionCandidates | null = null;
@@ -615,6 +959,10 @@ export function apply(ctx: Context, config: Config = {}): void {
       /* partial ok */
     }
     const { version: latest, note } = resolveTarget(cands);
+    const moduleLatest = await getModuleLatest(force);
+    const system = updateState.system ?? (await getSystemInfo());
+    const memTotalMb = readLinuxMemTotalMb();
+    if (system) syncAutoCheckFromStatus(installed, latest, system);
     return {
       runningVersion: running,
       installedVersion: installed,
@@ -624,8 +972,19 @@ export function apply(ctx: Context, config: Config = {}): void {
       channel,
       note,
       status: computeStatus(running, installed, latest),
-      system: updateState.system,
-      update: { ...updateState },
+      system,
+      platform: process.platform,
+      hostMemTotalMb: memTotalMb,
+      offlineInstallRecommended: capabilities.canInstall && shouldUseOfflineInstall(cfg as Record<string, unknown>, memTotalMb),
+      offlineInstallLog: offlineLogFile(),
+      autoRestart: autoRestartEnabled(cfg as Record<string, unknown>),
+      restartHint: manualRestartHint(),
+      capabilities,
+      moduleName: PLUGIN_PKG,
+      moduleVersion: PLUGIN_INSTALLED_VERSION,
+      moduleLatestVersion: moduleLatest,
+      moduleUpdateAvailable: !!(PLUGIN_INSTALLED_VERSION && moduleLatest && isNewer(PLUGIN_INSTALLED_VERSION, moduleLatest)),
+      update: enrichUpdateState({ ...updateState }, cfg.installTimeoutMs ?? 1_200_000),
     };
   }
 
@@ -665,9 +1024,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       return false;
     };
 
-    const rejectForbidden = (req: IncomingMessage, res: ServerResponse) => {
+    const rejectForbidden = (req: IncomingMessage, res: ServerResponse, message = '拒绝跨域请求') => {
       res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: false, busy: false, message: '\u62d2\u7edd\u8de8\u57df\u66f4\u65b0\u8bf7\u6c42' }));
+      res.end(JSON.stringify({ ok: false, busy: false, message }));
       void req;
     };
 
@@ -685,6 +1044,82 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       },
     });
+    const beginAsyncStep = (runner: () => Promise<void>) => {
+      if (updateState.running) return { ok: false as const, busy: true, message: '更新正在进行中，请稍候' };
+      updateState.running = true;
+      updateState.done = false;
+      updateState.ok = false;
+      updateState.restartScheduled = false;
+      updateState.failedStep = null;
+      const run = runner();
+      run
+        .catch((e) => {
+          const step = updateState.step === 'idle' ? 'check' : updateState.step;
+          failStep(step, errMsg(e));
+        })
+        .finally(() => {
+          updateState.running = false;
+        });
+      void run;
+      return { ok: true as const, busy: false };
+    };
+
+    const rejectDetectOnly = (res: ServerResponse) => {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, busy: false, message: capabilities.detectOnlyReason || '此环境仅支持版本检测' }));
+    };
+
+    const postStepRoute = (
+      path: string,
+      reset: () => void,
+      runner: () => Promise<void>,
+      opts?: { requiresInstall?: boolean; requiresRestart?: boolean },
+    ) => {
+      webServer.register({
+        kind: 'exact',
+        path,
+        handler: async (req, res) => {
+          if (!isSameOrigin(req)) {
+            rejectForbidden(req, res);
+            return;
+          }
+          if (opts?.requiresInstall && !capabilities.canInstall) {
+            rejectDetectOnly(res);
+            return;
+          }
+          if (opts?.requiresRestart && !capabilities.canRestart) {
+            rejectDetectOnly(res);
+            return;
+          }
+          try {
+            await readBody(req);
+          } catch {
+            /* ignore body parse */
+          }
+          reset();
+          const payload = beginAsyncStep(runner);
+          res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify(payload));
+        },
+      });
+    };
+
+    postStepRoute('/dsh-version-updater/check', () => {
+      updateState.phase = 'checking';
+      updateState.step = 'check';
+      updateState.tail = '';
+      updateState.message = '';
+      updateState.before = null;
+      updateState.after = null;
+      updateState.latest = null;
+      updateState.system = null;
+      updateState.startedAt = Date.now();
+    }, runCheckStep, { requiresInstall: false });
+
+    postStepRoute('/dsh-version-updater/install', () => {
+      /* keep check-done state except running flags */
+    }, runInstallStep, { requiresInstall: true });
+
     webServer.register({
       kind: 'exact',
       path: '/dsh-version-updater/start-update',
@@ -698,36 +1133,64 @@ export function apply(ctx: Context, config: Config = {}): void {
         } catch {
           /* ignore body parse */
         }
-        const payload: { ok: boolean; busy: boolean; message?: string } | undefined = await (async () => {
-          if (updateState.running)
-            return { ok: false, busy: true, message: '\u66f4\u65b0\u6b63\u5728\u8fdb\u884c\u4e2d\uff0c\u8bf7\u7a0d\u5019' };
-          updateState.running = true;
-          updateState.done = false;
-          updateState.ok = false;
-          updateState.phase = 'detect';
-          updateState.tail = '';
-          updateState.message = '';
-          updateState.before = null;
-          updateState.after = null;
-          updateState.latest = null;
-          updateState.system = null;
-          const run = runUpdate();
-          run
-            .catch((e) => {
-              updateState.phase = 'error';
-              updateState.ok = false;
-              updateState.message = errMsg(e);
-              updateState.done = true;
-              updateState.running = false;
-            })
-            .finally(() => {
-              updateState.running = false;
-            });
-          void run;
-          return { ok: true, busy: false };
-        })();
+        updateState.phase = 'checking';
+        updateState.step = 'check';
+        updateState.tail = '';
+        updateState.message = '';
+        updateState.before = null;
+        updateState.after = null;
+        updateState.latest = null;
+        updateState.system = null;
+        updateState.startedAt = Date.now();
+        const payload = beginAsyncStep(runCheckStep);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ...payload, deprecated: true, hint: '请使用分步流程：检查 → 安装 → 确认重启' }));
+      },
+    });
+    webServer.register({
+      kind: 'exact',
+      path: '/dsh-version-updater/restart',
+      handler: async (req, res) => {
+        if (!isSameOrigin(req)) {
+          rejectForbidden(req, res);
+          return;
+        }
+        if (!capabilities.canRestart) {
+          rejectDetectOnly(res);
+          return;
+        }
+        try {
+          await readBody(req);
+        } catch {
+          /* ignore body parse */
+        }
+        const r = scheduleProcessRestart({
+          reason: 'version-autoupdate-manual',
+          cfg: cfg as Record<string, unknown>,
+          delayMs: cfg.restartDelayMs,
+          force: true,
+        });
+        updateState.phase = 'restarting';
+        updateState.step = 'restart';
+        updateState.restartScheduled = !!r.restartScheduled || isRestartScheduled();
+        if (r.restartScheduled) {
+          updateState.message = r.message || '正在重启…';
+        } else if (r.skipped) {
+          updateState.message = r.message || manualRestartHint();
+        } else if (r.error) {
+          failStep('restart', r.error);
+        }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-        res.end(JSON.stringify(payload));
+        res.end(
+          JSON.stringify({
+            ok: !!r.ok,
+            restartScheduled: !!r.restartScheduled || isRestartScheduled(),
+            skipped: !!r.skipped,
+            platform: process.platform,
+            autoRestart: autoRestartEnabled(cfg as Record<string, unknown>),
+            message: r.message || r.error || manualRestartHint(),
+          }),
+        );
       },
     });
   };
