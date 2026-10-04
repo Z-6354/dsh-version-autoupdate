@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Context } from '@deepseek-ai/cordis';
-import { findDshRoot } from './dsh-root.js';
+import { findDshRoot, detectDshInstallMethod } from './dsh-root.js';
 import z from '@deepseek-ai/schemastery';
 import {
   buildGlobalInstallArgv,
@@ -11,6 +11,9 @@ import {
   lowMemoryInstallWarning,
   packageManagerSearchPaths,
   runningNodeSatisfiesDsh,
+  globalRootArgv,
+  globalDshRoot,
+  isSameInstallation,
 } from './package-manager.js';
 import { isNewer, semverParts, versionCompare } from './semver.js';
 import { estimateInstallProgress } from './update-progress.js';
@@ -302,7 +305,7 @@ async function fetchRegistryBody(ctx: Context, packageName = '@deepseek-ai/dsh')
   if (!sub) return null;
   const nodeExe = process.execPath;
   const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
-  const cwd = sp?.workspaceRoot || '/tmp';
+  const cwd = sp?.workspaceRoot || process.cwd();
   let handle: CollectHandle | undefined;
   try {
     handle = sub.spawn({
@@ -563,7 +566,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       installMethod: 'unknown' as string,
       packageManager,
     };
-    if (dshRoot) sys.installMethod = dshRoot.includes('/node_modules/') ? 'npm' : 'git';
+    sys.installMethod = detectDshInstallMethod(dshRoot);
     return sys;
   }
 
@@ -601,7 +604,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       }
     }
 
-    const wanted = cfg.packageManager === 'auto' ? ['npm', 'pnpm', 'yarn'] : [cfg.packageManager!];
+    const wanted = cfg.packageManager === 'auto' ? ['npm', 'pnpm', 'yarn'] : [cfg.packageManager ?? 'npm'];
     for (const name of wanted) {
       for (const candidate of packageManagerSearchPaths({
         dshRoot,
@@ -731,7 +734,7 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   async function runInstall(pmExe: string, version: string): Promise<void> {
     const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
-    const cwd = sp?.workspaceRoot || '/tmp';
+    const cwd = sp?.workspaceRoot || process.cwd();
     const installTimeoutMs = Math.max(60_000, cfg.installTimeoutMs ?? 1_200_000);
     // Default 0: npm often has multi-minute silent phases; 300s idle kill was aborting real installs.
     const installIdleTimeoutMs = Math.max(0, cfg.installIdleTimeoutMs ?? 0);
@@ -844,6 +847,45 @@ export function apply(ctx: Context, config: Config = {}): void {
     const pmResolved = await resolvePackageManager(dshRoot);
     if (!pmResolved) {
       failStep('install', '未找到包管理器，无法安装');
+      return;
+    }
+
+    // A global install must update the package this process actually loaded.
+    // Desktop, npx and project-local packages are owned by a different updater.
+    const system = await detectSystem(dshRoot, pmResolved);
+    if (!dshRoot || system.installMethod !== 'npm') {
+      failStep('install', '当前不是可验证的 npm 全局安装；桌面版请使用官方更新，npx/源码安装请按原方式升级。');
+      return;
+    }
+    const sub = ctx.get('subprocess') as { spawn(spec: Record<string, unknown>): CollectHandle } | undefined;
+    const timer = ctx.get('timer') as { timeout(fn: () => void, ms: number): () => void } | undefined;
+    if (!sub || !timer) {
+      failStep('install', '无法验证包管理器的全局安装目录');
+      return;
+    }
+    try {
+      const handle = sub.spawn({
+        argv: globalRootArgv(pmResolved), cwd: process.cwd(), env: buildInstallEnv(),
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 65536 }, stderr: { maxBytes: 65536 } },
+        graceMs: 5000,
+      });
+      let timedOut = false;
+      const clear = timer.timeout(() => {
+        timedOut = true;
+        try { handle.terminate(); } catch { /* already exited */ }
+      }, 15000);
+      let targetRoot: string | null;
+      try {
+        const outcome = await handle.done;
+        if (timedOut || outcome.exitCode !== 0) throw new Error('全局目录查询失败或超时');
+        targetRoot = globalDshRoot(pmResolved, handle.collected?.stdout?.readFrom(0).text ?? '');
+      } finally { clear(); }
+      if (!targetRoot || !isSameInstallation(dshRoot, targetRoot)) {
+        failStep('install', '包管理器全局目录与当前 DSH 安装位置不一致，请使用原安装方式升级或配置正确的 packageManagerPath。');
+        return;
+      }
+    } catch (e) {
+      failStep('install', `无法验证全局安装目标：${errMsg(e)}`);
       return;
     }
 
@@ -979,7 +1021,7 @@ export function apply(ctx: Context, config: Config = {}): void {
       offlineInstallLog: offlineLogFile(),
       autoRestart: autoRestartEnabled(cfg as Record<string, unknown>),
       restartHint: manualRestartHint(),
-      capabilities,
+      capabilities: resolveUpdateCapabilities(process.platform, cfg.updatePolicy ?? 'platform', system?.installMethod ?? 'unknown'),
       moduleName: PLUGIN_PKG,
       moduleVersion: PLUGIN_INSTALLED_VERSION,
       moduleLatestVersion: moduleLatest,
@@ -996,6 +1038,21 @@ export function apply(ctx: Context, config: Config = {}): void {
 
   const registerRoutes = () => {
     if (!webServer) return;
+    const registerRoute = (route: Parameters<NonNullable<typeof webServer>['register']>[0]) => {
+      ctx.effect(() => webServer.register(route), `dsh-version-autoupdate: ${route.path}`);
+    };
+    const requireMethod = (req: IncomingMessage, res: ServerResponse, method: string): boolean => {
+      if (req.method === method) return true;
+      res.writeHead(405, { 'Content-Type': 'application/json; charset=utf-8', Allow: method });
+      res.end(JSON.stringify({ ok: false, message: `请使用 ${method} 请求` }));
+      return false;
+    };
+    const rejectBusy = (res: ServerResponse): boolean => {
+      if (!updateState.running) return false;
+      res.writeHead(409, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, busy: true, message: '更新正在进行中，请稍候' }));
+      return true;
+    };
     const trustedOrigins: string[] = Array.isArray(cfg.trustedOrigins)
       ? cfg.trustedOrigins
       : [];
@@ -1030,10 +1087,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       void req;
     };
 
-    webServer.register({
+    registerRoute({
       kind: 'exact',
       path: '/dsh-version-updater/status',
       handler: async (_req, res) => {
+        if (!requireMethod(_req, res, 'GET')) return;
         try {
           const payload = await statusPayload(Boolean(cfg.force));
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -1044,8 +1102,9 @@ export function apply(ctx: Context, config: Config = {}): void {
         }
       },
     });
-    const beginAsyncStep = (runner: () => Promise<void>) => {
+    const beginAsyncStep = (runner: () => Promise<void>, reset: () => void = () => {}) => {
       if (updateState.running) return { ok: false as const, busy: true, message: '更新正在进行中，请稍候' };
+      reset();
       updateState.running = true;
       updateState.done = false;
       updateState.ok = false;
@@ -1075,10 +1134,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       runner: () => Promise<void>,
       opts?: { requiresInstall?: boolean; requiresRestart?: boolean },
     ) => {
-      webServer.register({
+      registerRoute({
         kind: 'exact',
         path,
         handler: async (req, res) => {
+          if (!requireMethod(req, res, 'POST')) return;
           if (!isSameOrigin(req)) {
             rejectForbidden(req, res);
             return;
@@ -1096,8 +1156,7 @@ export function apply(ctx: Context, config: Config = {}): void {
           } catch {
             /* ignore body parse */
           }
-          reset();
-          const payload = beginAsyncStep(runner);
+          const payload = beginAsyncStep(runner, reset);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify(payload));
         },
@@ -1120,10 +1179,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       /* keep check-done state except running flags */
     }, runInstallStep, { requiresInstall: true });
 
-    webServer.register({
+    registerRoute({
       kind: 'exact',
       path: '/dsh-version-updater/start-update',
       handler: async (req, res) => {
+        if (!requireMethod(req, res, 'POST')) return;
         if (!isSameOrigin(req)) {
           rejectForbidden(req, res);
           return;
@@ -1133,24 +1193,26 @@ export function apply(ctx: Context, config: Config = {}): void {
         } catch {
           /* ignore body parse */
         }
-        updateState.phase = 'checking';
-        updateState.step = 'check';
-        updateState.tail = '';
-        updateState.message = '';
-        updateState.before = null;
-        updateState.after = null;
-        updateState.latest = null;
-        updateState.system = null;
-        updateState.startedAt = Date.now();
-        const payload = beginAsyncStep(runCheckStep);
+        const payload = beginAsyncStep(runCheckStep, () => {
+          updateState.phase = 'checking';
+          updateState.step = 'check';
+          updateState.tail = '';
+          updateState.message = '';
+          updateState.before = null;
+          updateState.after = null;
+          updateState.latest = null;
+          updateState.system = null;
+          updateState.startedAt = Date.now();
+        });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ...payload, deprecated: true, hint: '请使用分步流程：检查 → 安装 → 确认重启' }));
       },
     });
-    webServer.register({
+    registerRoute({
       kind: 'exact',
       path: '/dsh-version-updater/restart',
       handler: async (req, res) => {
+        if (!requireMethod(req, res, 'POST')) return;
         if (!isSameOrigin(req)) {
           rejectForbidden(req, res);
           return;
@@ -1159,11 +1221,20 @@ export function apply(ctx: Context, config: Config = {}): void {
           rejectDetectOnly(res);
           return;
         }
+        if (rejectBusy(res)) return;
         try {
           await readBody(req);
         } catch {
           /* ignore body parse */
         }
+        if (rejectBusy(res)) return;
+        const system = await getSystemInfo();
+        const allowed = resolveUpdateCapabilities(process.platform, cfg.updatePolicy ?? 'platform', system?.installMethod ?? 'unknown');
+        if (!allowed.canRestart) {
+          rejectForbidden(req, res, allowed.detectOnlyReason);
+          return;
+        }
+        if (rejectBusy(res)) return;
         const r = scheduleProcessRestart({
           reason: 'version-autoupdate-manual',
           cfg: cfg as Record<string, unknown>,

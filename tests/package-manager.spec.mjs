@@ -8,6 +8,8 @@ import {
   nodePrefixFromDshRoot,
   packageManagerSearchPaths,
   runningNodeSatisfiesDsh,
+  globalRootArgv,
+  globalDshRoot,
 } from '../lib/package-manager.js';
 
 describe('package-manager', () => {
@@ -45,10 +47,28 @@ describe('package-manager', () => {
     assert.equal(runningNodeSatisfiesDsh('v20.0.0').ok, false);
   });
 
+  it('rejects Node 23 and malformed versions while accepting supported releases', () => {
+    for (const v of ['v23.0.0', 'v22.18.0', 'garbage', 'v24.0.0-rc.1']) {
+      assert.equal(runningNodeSatisfiesDsh(v).ok, false, v);
+    }
+    for (const v of ['v22.20.0', 'v24.0.0', 'v25.0.0']) {
+      assert.equal(runningNodeSatisfiesDsh(v).ok, true, v);
+    }
+  });
+
   it('builds npm global install argv with optional omit and retries', () => {
     const argv = buildGlobalInstallArgv('/usr/bin/npm', '0.1.0-rc.8');
     assert.deepEqual(argv.slice(0, 4), ['/usr/bin/npm', 'install', '-g', '@deepseek-ai/dsh@0.1.0-rc.8']);
     assert.ok(argv.includes('--omit=optional'));
     assert.ok(argv.includes('--fetch-timeout=300000'));
+  });
+
+  it('locates each supported package manager global root without installing', () => {
+    assert.deepEqual(globalRootArgv('C:\\node\\npm.cmd'), ['C:\\node\\npm.cmd', 'root', '-g']);
+    assert.deepEqual(globalRootArgv('pnpm'), ['pnpm', 'root', '-g']);
+    assert.deepEqual(globalRootArgv('yarn'), ['yarn', 'global', 'dir']);
+    assert.equal(globalDshRoot('npm', '/prefix/node_modules\n'), join('/prefix/node_modules', '@deepseek-ai', 'dsh'));
+    assert.equal(globalDshRoot('yarn', '/yarn/global\n'), join('/yarn/global', 'node_modules', '@deepseek-ai', 'dsh'));
+    assert.equal(globalDshRoot('npm', 'not a path'), null);
   });
 });

@@ -27,4 +27,16 @@ describe('platform policy', () => {
     const c = resolveUpdateCapabilities('linux', 'full');
     assert.equal(c.canInstall, true);
   });
+
+  it('blocks desktop, npx and unknown installs even under full policy', () => {
+    for (const method of ['desktop', 'npx', 'unknown']) {
+      const c = resolveUpdateCapabilities('win32', 'full', method);
+      assert.equal(c.canInstall, false);
+      assert.equal(c.canRestart, false);
+      assert.ok(c.detectOnlyReason);
+    }
+    const source = resolveUpdateCapabilities('win32', 'full', 'git');
+    assert.equal(source.canInstall, false);
+    assert.equal(source.canRestart, true);
+  });
 });

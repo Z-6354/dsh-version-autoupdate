@@ -1,11 +1,15 @@
 import type { Context } from '@deepseek-ai/cordis';
 import { dirname, join } from 'node:path';
 
-const KNOWN_DEPLOYMENT_ROOTS = [
-  '/home/ubuntu/.local/node-v22.19.0/lib/node_modules/@deepseek-ai/dsh',
-];
-
 const HARNESS_CLI_MARKERS = ['/apps/cli/src/bin.ts', '/apps/cli/lib/bin.js', '/apps/cli/src/bin.js'];
+
+export function detectDshInstallMethod(root: string | null, argv = process.argv, electron = process.versions.electron): string {
+  if (electron || argv.some(arg => /[/\\]dsh-desktop-host[/\\]/.test(arg))) return 'desktop';
+  if (!root) return 'unknown';
+  const normalized = root.replace(/\\/g, '/');
+  if (normalized.includes('/_npx/')) return 'npx';
+  return normalized.includes('/node_modules/') ? 'npm' : 'git';
+}
 
 const DSH_PACKAGE_NAMES = new Set(['@deepseek-ai/dsh', '@deepseek-ai/dsh-root']);
 
@@ -44,7 +48,7 @@ export function dshRootFromExecutable(exe: string): string | null {
   return null;
 }
 
-/** Locate the installed DSH package root (global npm, harness checkout, or known deploy paths). */
+/** Locate the running DSH package; use installation discovery only without a recognized entry. */
 export async function findDshRoot(ctx: Context): Promise<string | null> {
   const fsSvc = ctx.get('fs') as
     | {
@@ -56,13 +60,23 @@ export async function findDshRoot(ctx: Context): Promise<string | null> {
 
   const roots: string[] = [];
 
+  const desktopEntry = process.argv.findIndex(arg => /[/\\]dsh-desktop-host[/\\]/.test(arg));
+  if (desktopEntry >= 0 && process.argv[desktopEntry + 1]) {
+    pushRoot(roots, join(process.argv[desktopEntry + 1]!, 'node_modules', '@deepseek-ai', 'dsh'));
+  }
+
   for (const arg of process.argv) {
     const norm = String(arg).replace(/\\/g, '/');
+    // Resolve the running CLI before unrelated workspace/PATH installations.
+    if (norm.endsWith('/lib/bin.js') && norm.includes('/node_modules/@deepseek-ai/dsh/')) {
+      pushRoot(roots, dshRootFromExecutable(norm));
+    }
     for (const marker of HARNESS_CLI_MARKERS) {
       const i = norm.indexOf(marker);
       if (i > 0) pushRoot(roots, norm.slice(0, i));
     }
   }
+  const runningRootCount = roots.length;
 
   const sp = ctx.get('sandboxPolicy') as { workspaceRoot?: string } | undefined;
   if (sp?.workspaceRoot) pushRoot(roots, sp.workspaceRoot);
@@ -85,17 +99,16 @@ export async function findDshRoot(ctx: Context): Promise<string | null> {
   }
 
   try {
-    pushRoot(roots, join(process.env.APPDATA || '', 'npm', 'node_modules', '@deepseek-ai', 'dsh'));
+    if (process.env.APPDATA) pushRoot(roots, join(process.env.APPDATA, 'npm', 'node_modules', '@deepseek-ai', 'dsh'));
     pushRoot(roots, join(dirname(process.execPath), 'node_modules', '@deepseek-ai', 'dsh'));
     pushRoot(roots, join(dirname(process.execPath), '..', 'lib', 'node_modules', '@deepseek-ai', 'dsh'));
   } catch {
     /* ignore */
   }
 
-  for (const root of KNOWN_DEPLOYMENT_ROOTS) pushRoot(roots, root);
-
   const seen = new Set<string>();
-  for (const root of roots) {
+  // An unreadable running package is unknown, never a different PATH install.
+  for (const root of runningRootCount ? roots.slice(0, runningRootCount) : roots) {
     if (!root || seen.has(root)) continue;
     seen.add(root);
 

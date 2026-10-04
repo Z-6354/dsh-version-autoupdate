@@ -5,9 +5,7 @@
 #   - packageManager: 'npm' | 'pnpm' | 'yarn' | 'auto' (default npm; resolves beside running dsh Node)
 #   - packageManagerPath: absolute path override (e.g. /home/ubuntu/.local/node-v22.19.0/bin/npm)
 #   - minAvailableMemoryMb: refuse update when Linux MemAvailable is below this (default 400, 0=off)
-#   - installTimeoutMs: global install max wait (default 600000 = 10 min; slow VPS use 900000+)
-#   - installGraceMs: SIGTERM grace before force-kill (default 60000)
-#   - installTimeoutMs: global install subprocess timeout (default 600000 = 10 min)
+#   - installTimeoutMs: global install max wait (default 1200000 = 20 min)
 #   - installGraceMs: SIGTERM grace before force-kill (default 60000)
 #   - channel: 'preview' (default; highest version incl. pre-releases) | 'stable'
 #   - force: boolean (bypass registry cache on /status)
@@ -30,4 +28,4 @@
         force: false
         channel: preview
         # reverse-proxied public origins allowed to trigger updates
-        trustedOrigins: [dsh.wannian.fun, wannian.fun, www.wannian.fun]
+        trustedOrigins: []

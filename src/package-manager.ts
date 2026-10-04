@@ -1,10 +1,42 @@
 import { dirname, join } from 'node:path';
-import { versionCompare } from './semver.js';
+import { realpathSync } from 'node:fs';
+import { semverParts, versionCompare } from './semver.js';
 
 /** Minimum Node for DSH global installs (matches harness engine floor). */
 export const MIN_NODE_FOR_DSH = '22.19.0';
+export const NODE_RANGE_FOR_DSH = '^22.19.0 || >=24.0.0';
 
 const DSH_PKG_SUFFIX = '/lib/node_modules/@deepseek-ai/dsh';
+
+function packageManagerName(pmExe: string): string {
+  return pmExe.replace(/\\/g, '/').split('/').pop()?.replace(/\.(cmd|exe)$/i, '') ?? pmExe;
+}
+
+/** Read-only command locating the global package directory used by this manager. */
+export function globalRootArgv(pmExe: string): string[] {
+  return packageManagerName(pmExe) === 'yarn'
+    ? [pmExe, 'global', 'dir']
+    : [pmExe, 'root', '-g'];
+}
+
+export function globalDshRoot(pmExe: string, output: string): string | null {
+  const lines = output.trim().split(/\r?\n/).filter(Boolean);
+  const root = lines.at(-1)?.trim();
+  if (!root || !/^(?:[a-z]:[/\\]|[/\\]{1,2})/i.test(root)) return null;
+  const base = packageManagerName(pmExe) === 'yarn' ? join(root, 'node_modules') : root;
+  return join(base, '@deepseek-ai', 'dsh');
+}
+
+/** Compare real paths so symlinked installs work and unrelated globals cannot be upgraded. */
+export function isSameInstallation(runningRoot: string, targetRoot: string): boolean {
+  try {
+    const normalize = (p: string) => {
+      const path = realpathSync(p).replace(/\\/g, '/');
+      return process.platform === 'win32' ? path.toLowerCase() : path;
+    };
+    return normalize(runningRoot) === normalize(targetRoot);
+  } catch { return false; }
+}
 
 /** Derive the Node install prefix from a global @deepseek-ai/dsh package root. */
 export function nodePrefixFromDshRoot(root: string): string | null {
@@ -49,11 +81,13 @@ export function buildInstallEnv(nodeBinDir = dirname(process.execPath)): NodeJS.
 
 export function runningNodeSatisfiesDsh(version = process.version): { ok: true; version: string } | { ok: false; version: string; message: string } {
   const normalized = version.replace(/^v/i, '');
-  if (versionCompare(normalized, MIN_NODE_FOR_DSH) < 0) {
+  const parsed = semverParts(normalized);
+  if (!parsed || parsed.pre.length > 0 || !(parsed.nums[0]! >= 24 ||
+    (parsed.nums[0] === 22 && versionCompare(normalized, MIN_NODE_FOR_DSH) >= 0))) {
     return {
       ok: false,
       version,
-      message: `当前运行 Node ${version} 不满足 DSH 要求 (>= v${MIN_NODE_FOR_DSH})，请先切换到正确 Node 后再更新。`,
+      message: `当前运行 Node ${version} 不满足 DSH 要求 (${NODE_RANGE_FOR_DSH})，请先切换到正确 Node 后再更新。`,
     };
   }
   return { ok: true, version };
@@ -62,8 +96,7 @@ export function runningNodeSatisfiesDsh(version = process.version): { ok: true; 
 /** argv for `npm|pnpm|yarn install -g @deepseek-ai/dsh@<version>`. */
 export function buildGlobalInstallArgv(pmExe: string, version: string): string[] {
   const spec = '@deepseek-ai/dsh@' + version;
-  const base = pmExe.replace(/\\/g, '/');
-  const name = base.split('/').pop()?.replace(/\.(cmd|exe)$/i, '') ?? pmExe;
+  const name = packageManagerName(pmExe);
   if (name === 'pnpm') {
     return [pmExe, 'add', '-g', spec, '--no-optional'];
   }

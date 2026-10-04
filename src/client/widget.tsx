@@ -127,7 +127,7 @@ function DetailPanel(props: {
   color: string;
   layout: PanelLayout;
   onClose: () => void;
-  children: React.ReactNode;
+  children?: React.ReactNode;
 }): React.ReactElement {
   const { color, layout, onClose, children } = props;
   return React.createElement(

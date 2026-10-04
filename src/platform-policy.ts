@@ -19,7 +19,23 @@ export interface UpdateCapabilities {
 export function resolveUpdateCapabilities(
   platform: NodeJS.Platform,
   policy: UpdatePolicy = 'platform',
+  installMethod?: string,
 ): UpdateCapabilities {
+  if (installMethod && installMethod !== 'npm') {
+    const base = resolveUpdateCapabilities(platform, policy);
+    const reasons: Record<string, string> = {
+      desktop: '桌面版请使用 DSH 官方更新流程。',
+      npx: '当前为 npx 临时安装，请按原启动方式获取新版本。',
+      git: '当前为源码安装，请在源码目录手动更新和构建。',
+      unknown: '无法确认当前安装来源，仅提供版本检测。',
+    };
+    return {
+      canDetect: true,
+      canInstall: false,
+      canRestart: installMethod === 'git' && base.canRestart,
+      detectOnlyReason: reasons[installMethod] ?? reasons.unknown!,
+    };
+  }
   if (policy === 'detect-only') {
     return {
       canDetect: true,
@@ -49,6 +65,6 @@ export function resolveUpdateCapabilities(
     canDetect: true,
     canInstall: false,
     canRestart: false,
-    detectOnlyReason: 'Linux 服务器仅显示版本检测结果；请在 Windows 本机或 SSH 手动升级。',
+    detectOnlyReason: `${platform === 'darwin' ? 'macOS' : 'Linux'} 默认仅检测；请按原安装方式升级，或配置 updatePolicy: full。`,
   };
 }

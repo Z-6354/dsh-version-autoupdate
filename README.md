@@ -1,98 +1,91 @@
 # dsh-version-autoupdate
 
-DSH (DeepSeek Harness) 双面 Cordis 插件：在 Web UI 中显示 DSH 版本角标（最新=绿 / 可更新=黄 / 待重启=蓝 / 失败=红 / 未知=灰），并支持**一键自动更新**。
+DSH 双面 Cordis 插件：显示可拖动的浮动版本胶囊，提供版本检测、安装、确认重启三个步骤。
 
-## 功能
+## 功能和更新边界
 
-- **版本角标**：右上角（会话头部工具栏）常驻显示当前运行版本的更新状态，每 60 秒自动刷新。
-- **状态判定**：对比「当前运行 / 已安装 / 目标最新」，语义化版本比较（含 `-rc.N` 预发布段）。
-- **目标版本 = registry 最高版本**：不依赖 npm `latest` 标签（历史上常滞后于真正最高版本），而是枚举 registry 全部版本取语义化最高者——因此从 DSH `0.1.0-rc.6` 到未来的 `0.6.x` 都能被正确识别并追新。
-- **更新通道 `channel`**（插件配置，可切）：
-  - `preview`（默认）：最高版本，含预发布/rc（如 `0.1.0-rc.8`、未来 `0.6.0-rc.N`）；
-  - `stable`：只认不带预发布后缀的最高正式版；若暂无正式版则自动回退到 preview。
-  - 面板会同时显示「预览最新 / 稳定最新 / 目标版本（按当前通道）」。
-- **一键更新**：可更新时点击角标 → 面板 → 「⚡ 立即更新」，使用**与当前 dsh 同 Node 目录的 npm**（不再误用 PATH 里的 Cursor/旧 Node）执行 `npm install -g @deepseek-ai/dsh@<target>` → 显示实时进度 → 「更新完成 · 重启生效」。默认安装超时 **10 分钟**（`installTimeoutMs`，小型 VPS 可调大）。内存不足（Linux MemAvailable < 400MB）时会拒绝安装，避免半装损坏。
-- **只读探测**：拉取仅通过 `subprocess` + `web` 服务的只读链路；更新由用户点按钮触发，不静默后台安装。
-- **点击外部关闭**：面板在点击任意非角标区域后自动关闭（无 × 按钮）。
+- 每 60 秒检测运行版本、磁盘版本和 npm 目标版本；执行更新期间加快刷新。
+- `preview`（默认）取 registry 中语义化最高版本，包含 alpha/rc；`stable` 取最高正式版，没有正式版时回退 preview。`preview` 不等同 npm `latest`。
+- Windows 默认允许 npm 安装和确认重启；Linux/macOS 默认仅检测。使用 `updatePolicy: full` 可启用支持的 CLI 更新操作。
+- 只有包管理器的全局目录与当前运行包的真实路径一致，才执行全局安装。桌面版、npx、源码和未知安装来源不执行全局安装；桌面版和 npx 不提供进程重启。
+- 桌面版请使用 DSH 官方更新流程；插件尚未接入桌面原生 updates bridge。
+- 全局安装优先使用当前 Node 同目录的包管理器，支持 npm/pnpm/Yarn Classic。查询全局目录失败或目标不一致会阻止安装。
+- 安装成功后点击确认重启；运行进程启动时读取的版本与磁盘版本分开显示。
 
-## 架构
-
-- **Host 面**（`src/index.ts`）：纯逻辑 + 服务消费（`fs` / `subprocess` / `web` / `sandboxPolicy` / `timer` / `webServer`）。通过 `webServer.register` 暴露同源 JSON API：
-  - `GET /dsh-version-updater/status`
-  - `POST /dsh-version-updater/start-update`
-- **Client 面**（`src/client.tsx`）：通过 `exports["./client"]` 分发，注册到会话头部工具栏槽位，调用上面的 JSON API 渲染角标与面板。
-
-## 安装
+## 安装和使用
 
 ```bash
 npm i -g dsh-version-autoupdate
-# 在 cordis.yml 中写入一行：
-# - id: dsh-version-autoupdate
-#   name: 'dsh-version-autoupdate'
 ```
 
-> **验证边界（重要）**
-> Host 面的版本探测与更新逻辑通过真实的 DSH Service 接口实现，并已在本仓库做单测烟测。Client 面遵循 DSH 官方双面插件布局（`dsh.client` + `exports["./client"]`），槽位与 JSON 通信按当前版本接口实现，但在你的目标 DSH 版本上**可能需按该版本的槽位键/契约微调**。请以目标部署的实际 `dsh install` 结果为准。
-
-## 使用
-
-安装并加载插件后：
-
-1. 重启 `dsh web` 服务，右上角出现版本角标。
-2. 角标颜色含义见上。
-3. 当显示「可更新」时点击角标 → 面板 → 「⚡ 立即更新」，等待完成。
-4. 完成后提示**重启 `dsh web` 进程**使新版本生效（运行中的进程无法安全自重启）。
-5. 想切换更新通道（预览/稳定）在 DSH 插件配置里把 `channel` 改为 `preview` 或 `stable` 后重启即可。
-
-## 配置（cordis.yml / cordis.patch.yml）
-
-| 字段 | 默认 | 说明 |
-|------|------|------|
-| `packageManager` | `npm` | 固定用 npm；也可 `pnpm` / `yarn` / `auto` |
-| `packageManagerPath` | — | **推荐在 2G VPS 上显式指定**，如 `/home/ubuntu/.local/node-v22.19.0/bin/npm` |
-| `minAvailableMemoryMb` | `400` | Linux 可用内存低于此值时拒绝更新（`0` 关闭） |
-| `installTimeoutMs` | `600000` | 全局安装最长等待时间（毫秒），默认 10 分钟；慢速 VPS 可调到 `900000`（15 分钟） |
-| `installGraceMs` | `60000` | 超时后 SIGTERM 的宽限期（毫秒） |
-| `channel` | `preview` | `stable` 只追正式版 |
+使用当前 DSH 版本的插件管理流程加载该包。包声明 `dsh.bundle.patch` 和 `exports["./client"]`；如手动配置 profile，Host 插件行如下：
 
 ```yaml
 - id: dsh-version-autoupdate
   name: dsh-version-autoupdate
   config:
-    packageManager: npm
-    packageManagerPath: /home/ubuntu/.local/node-v22.19.0/bin/npm
-    minAvailableMemoryMb: 400
-    installTimeoutMs: 900000   # 15 min on slow 2G VPS
+    channel: preview
+    updatePolicy: platform
 ```
 
-## 更新超时
+启动或重启 `dsh web` 后，通过浮动胶囊查看版本并执行检查、安装、确认重启。POSIX 上默认仅检测，可按部署情况选择 `full` 或通过原安装方式手动升级。
 
-若面板显示「更新超时（600 秒）」且 npm 日志仍在 `http fetch`，说明安装未失败，只是超过了默认等待时间。可：
+## 配置
 
-1. 在插件配置中增大 `installTimeoutMs`（如 `900000`）后重启 `dsh web` 再试；
-2. 或 SSH 到服务器手动执行（使用**与 dsh 同 Node 的 npm 绝对路径**）：
+| 字段 | Schema 默认值 | 说明 |
+| --- | --- | --- |
+| `packageManager` | `npm` | `npm` / `pnpm` / `yarn` / `auto` |
+| `packageManagerPath` | 无 | 包管理器可执行文件的绝对路径；仍会核对全局安装目录 |
+| `channel` | `preview` | 最高版本含 alpha/rc；`stable` 仅正式版，无正式版时回退 |
+| `updatePolicy` | `platform` | Windows CLI 可更新，Linux/macOS 仅检测；可选 `full` / `detect-only`，安装来源限制始终生效 |
+| `minAvailableMemoryMb` | `400` | Linux 可用内存低于阈值时拒绝更新；`0` 关闭 |
+| `installTimeoutMs` | `1200000` | 安装总超时，默认 20 分钟 |
+| `installIdleTimeoutMs` | `0` | 无输出超时，默认关闭，避免 npm 静默下载时被误终止 |
+| `installGraceMs` | `60000` | 终止后的等待时间 |
+| `autoRestart` | `false` | 保留的重启策略项；当前分步流程仍需点击确认重启，Windows 不自动重启 |
+| `restartDelayMs` | `2000` | 确认重启后的延迟 |
+| `offlineInstall` | `auto` | Linux 低内存离线安装；`always` / `never` 可覆盖。随包模板使用 `never` |
+| `offlineInstallMaxMemMb` | `2560` | `auto` 模式的总内存阈值 |
+| `systemdUnit` | `dsh-web.service` | 离线安装停止和启动的 systemd unit |
+| `trustedOrigins` | `[]` | 反向代理改写 Host 时允许的来源主机名，由部署者设置 |
+| `force` | `false` | 状态请求绕过 registry 缓存 |
 
-```bash
-/home/ubuntu/.local/node-v22.19.0/bin/npm install -g @deepseek-ai/dsh@0.1.0-rc.8 --no-audit --no-fund --omit=optional
-```
+重启日志、离线日志和状态文件使用非空 `DSH_HOME`，未设置时使用 `~/.dsh`；支持 `~` 展开。插件未提供独立的 home 配置项。
 
-超时**不等于** dsh 已损坏；只有安装命令非零退出且 `dsh` 无法启动时才需要回滚到旧版本。
+## 兼容性和验证
 
-若 `npm install -g` 中途被 OOM 杀死，`dsh` 可能每 5 秒崩溃重启。在控制台 VNC 登录后执行：
+适配依据为 DSH `0.2.0-rc.2` 及 `0.2.1-alpha.1` 官方源码。当前 Node 预检遵循上游根清单的 `^22.19.0 || >=24.0.0`，拒绝 Node 23；目标版本以后若变更要求，需要重新适配。
 
-```bash
-/home/ubuntu/.local/node-v22.19.0/bin/npm install -g @deepseek-ai/dsh@<上一个正常版本>
-# 或
-npm install -g @deepseek-ai/dsh@latest   # 确认 which npm 指向正确 Node
-```
+已移除旧 `dsh-client-runtime` 包依赖，客户端仍使用 ModuleLoader 和 `shell.overlay`，React 由 DSH 提供。Host 路由与客户端挂载都随插件生命周期清理。
+
+仓库测试包含模拟服务、客户端 bundle 加载、安装目标核对与回归测试，不会执行真实 npm 全局安装或成功重启。真实 DSH Web/桌面验收、alpha 的代理路径前缀支持尚未完成；不能将构建或模拟测试通过视为实际部署验证。
+
+## HTTP API
+
+- `GET /dsh-version-updater/status`
+- `POST /dsh-version-updater/check`
+- `POST /dsh-version-updater/install`
+- `POST /dsh-version-updater/restart`
+- `POST /dsh-version-updater/start-update`：兼容旧入口，目前只启动检查，返回分步流程提示。
+
+方法不匹配返回 405；写操作检查来源；重复操作不能覆盖进行中的更新状态。重启在更新执行期间返回 409。
+
+## 更新故障排查
+
+全局目录不一致：确认 `packageManagerPath` 对应当前 DSH 安装，而不是 PATH 中的另一套 Node。npx、本地项目或桌面安装请按原方式升级。
+
+安装超时：检查日志与网络，必要时增大 `installTimeoutMs`，或使用已确认的包管理器路径手动安装目标版本。不要把超时等同于安装损坏；若安装失败且 DSH 无法启动，可按原安装方式恢复上一个正常版本。
 
 ## 开发
 
 ```bash
-npm install
-npm run build     # 先构建 client bundle (lib/client.js)，再 tsc 编译 host (lib/)
-npm test          # 构建校验
+npm ci
+npm test                 # 客户端类型检查、构建、全部回归测试
+npm run build
+npm pack --dry-run       # prepack 自动重新构建并检查发布文件
 ```
+
+构建输出在 `lib/`；新增 `.mjs` 和类型声明会自动复制，发布包包含源码子路径与客户端类型声明。客户端使用外部 source map，避免把调试数据内嵌到加载脚本。
 
 ## 许可
 

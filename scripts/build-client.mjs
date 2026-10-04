@@ -14,12 +14,14 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const ENTRY = join(ROOT, 'src', 'client', 'apply.ts');
 const OUT = join(ROOT, 'lib', 'client.js');
 const OUT_MAP = OUT + '.map';
+mkdirSync(dirname(OUT), { recursive: true });
 
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 const id = pkg.name;
 
 const result = esbuild.buildSync({
   entryPoints: [ENTRY],
+  outfile: OUT,
   bundle: true,
   format: 'cjs',
   platform: 'browser',
@@ -45,28 +47,29 @@ if (!jsFile) {
   process.exit(1);
 }
 
-let body = jsFile.text;
-body = body.replace(/^"use strict";\s*/m, '');
+const body = jsFile.text.replace(/^\/\/# sourceMappingURL=.*$/gm, '');
 
-const mapFooter = mapFile
-  ? (() => {
-    const raw = JSON.parse(mapFile.text);
-    raw.file = 'client.js';
-    writeFileSync(OUT_MAP, JSON.stringify(raw));
-    return '\n//# sourceMappingURL=client.js.map';
-  })()
-  : '';
-
-const bundle = `window.__ModuleLoader__.load({
+const prefix = `window.__ModuleLoader__.load({
 \tid: ${JSON.stringify(id)},
 \tfactory: (require) => {
 \t\tvar module = { exports: {} };
 \t\tvar exports = module.exports;
 \t\tObject.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
-${body
-  .split('\n')
-  .map((l) => (l === '' ? '' : '\t\t' + l))
-  .join('\n')}
+`;
+
+const mapFooter = mapFile
+  ? (() => {
+    const raw = JSON.parse(mapFile.text);
+    // An indexed map preserves esbuild's coordinates after adding the loader prefix.
+    writeFileSync(OUT_MAP, JSON.stringify({
+      version: 3, file: 'client.js',
+      sections: [{ offset: { line: prefix.split('\n').length - 1, column: 0 }, map: raw }],
+    }));
+    return '\n//# sourceMappingURL=client.js.map';
+  })()
+  : '';
+
+const bundle = `${prefix}${body}
 \t\treturn module.exports;
 \t}
 });${mapFooter}

@@ -7,7 +7,7 @@
  */
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import os from 'node:os';
+import { resolveDshHome } from './dsh-home.mjs';
 import { spawn } from 'node:child_process';
 
 function psQuote(s) {
@@ -31,7 +31,7 @@ function detectListenPort() {
 }
 
 function dshStateDir() {
-  const dir = join(os.homedir(), '.dsh');
+  const dir = resolveDshHome();
   try {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   } catch { /* ignore */ }

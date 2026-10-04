@@ -63,7 +63,9 @@ export function platformLabel(platform?: string, os?: string): string {
 
 export function installMethodLabel(method?: string): string {
   if (!method) return '—';
-  if (method === 'npm') return 'npm 全局包';
+  if (method === 'npm') return 'npm 包';
+  if (method === 'npx') return 'npx 临时包';
+  if (method === 'desktop') return 'DSH 桌面版';
   if (method === 'git') return 'git 源码';
   if (method === 'unknown') return '未知';
   return method;
