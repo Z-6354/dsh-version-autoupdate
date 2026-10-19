@@ -1,0 +1,16 @@
+export declare const LS_POS = "dsh-vau:pos";
+export declare const LS_COLLAPSED = "dsh-vau:collapsed";
+export declare const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+export declare const CAPSULE_W = 148;
+export declare const PANEL_W = 248;
+export declare const PANEL_MAX_H = 360;
+export declare const PANEL_EST_H = 300;
+export declare const CAPSULE_EST_H = 28;
+export declare const VIEW_MARGIN = 8;
+export declare const PANEL_GAP = 5;
+export declare const DRAG_THRESHOLD = 4;
+export declare const DEFAULT_TOP = 48;
+export declare const DEFAULT_RIGHT = 16;
+export declare const Z_INDEX = 10050;
+export declare const SCROLLBAR_CSS = "\n  .dsh-vau-panel-body::-webkit-scrollbar,\n  .dsh-vau-panel pre::-webkit-scrollbar { width: 8px; height: 8px; }\n  .dsh-vau-panel-body::-webkit-scrollbar-track,\n  .dsh-vau-panel pre::-webkit-scrollbar-track { background: rgba(255,255,255,0.04); border-radius: 4px; }\n  .dsh-vau-panel-body::-webkit-scrollbar-thumb,\n  .dsh-vau-panel pre::-webkit-scrollbar-thumb { background: rgba(161,161,170,0.45); border-radius: 4px; }\n  .dsh-vau-panel-body::-webkit-scrollbar-thumb:hover,\n  .dsh-vau-panel pre::-webkit-scrollbar-thumb:hover { background: rgba(161,161,170,0.7); }\n  .dsh-vau-panel-body { scrollbar-width: thin; scrollbar-color: rgba(161,161,170,0.45) rgba(255,255,255,0.04); }\n";
+//# sourceMappingURL=constants.d.ts.map

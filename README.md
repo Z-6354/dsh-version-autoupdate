@@ -1,91 +1,110 @@
 # dsh-version-autoupdate
 
-DSH 双面 Cordis 插件：显示可拖动的浮动版本胶囊，提供版本检测、安装、确认重启三个步骤。
+DSH（DeepSeek Harness）双面 Cordis 插件：Web UI 版本胶囊 + **同源**自动更新（npm 或 GitHub checkout，严格隔离）。
 
-## 功能和更新边界
+## 0.3.61：兼容与更新结果
 
-- 每 60 秒检测运行版本、磁盘版本和 npm 目标版本；执行更新期间加快刷新。
-- `preview`（默认）取 registry 中语义化最高版本，包含 alpha/rc；`stable` 取最高正式版，没有正式版时回退 preview。`preview` 不等同 npm `latest`。
-- Windows 默认允许 npm 安装和确认重启；Linux/macOS 默认仅检测。使用 `updatePolicy: full` 可启用支持的 CLI 更新操作。
-- 只有包管理器的全局目录与当前运行包的真实路径一致，才执行全局安装。桌面版、npx、源码和未知安装来源不执行全局安装；桌面版和 npx 不提供进程重启。
-- 桌面版请使用 DSH 官方更新流程；插件尚未接入桌面原生 updates bridge。
-- 全局安装优先使用当前 Node 同目录的包管理器，支持 npm/pnpm/Yarn Classic。查询全局目录失败或目标不一致会阻止安装。
-- 安装成功后点击确认重启；运行进程启动时读取的版本与磁盘版本分开显示。
+不绑定 DSH 的精确版本或源码 SHA。沿用 Cordis 4.x 与注入服务接口，声明宽版本范围，并包含目前 0.2.0 / 0.2.1 的预发布版本。DSH 版本号改变不会触发运行时白名单拒绝；接口发生实质变化时仍可能需要适配，不承诺任意未来版本。
 
-## 安装和使用
+- npm 安装前核对包管理器全局目录与正在运行的 DSH；安装后从同一目录读取版本并核对目标。
+- 要求重启时，状态保持 restarting，由独立 helper 的健康检查结果决定成功或失败；不重启时明确表示仅安装完成。
+- GitHub 重启保留 host、port、trusted-host、profile、patch 等原 CLI 参数。
+- GitHub 手动回滚在宿主退出后恢复旧 Git ref、构建产物并重建依赖链接，健康检查通过后才报告 rolled_back；保留原操作备份用于定位。
 
-```bash
-npm i -g dsh-version-autoupdate
+Host 运行时以 lib/*.js 为维护源；src/dsh-restart.mjs 与 src/offline-install.mjs 通过 npm run build 同步。无需为了旧 TypeScript 树重新生成运行时。
+
+## 功能概览
+
+| 能力 | 说明 |
+|------|------|
+| **版本胶囊** | 会话头部显示运行/已装/最新版本、安装来源、检测通道、错误信息 |
+| **同源检测** | 自动识别 `npm` / `github` / `unknown`；GitHub 安装只查 GitHub，npm 安装只查 npm |
+| **镜像 + 官方** | 默认 `auto`：优先镜像；**网络/限流**失败时回退官方源；**认证失败不回退**（重新询问密码或选官方）；完整性错误不回退 |
+| **MCP 更新** | `dsh_update_check` / `dsh_update` / `dsh_update_status` / `dsh_update_watch` / `dsh_update_rollback` |
+| **GitHub staging** | 下载 → 校验 → staging 构建 → promote 到 live（含 `pnpm rebuild` 原生模块）→ **版本变化时默认重启**。若桌面 Watchdog（`watch-dsh-web`）在跑，插件只退出并写 outcome，由 Watchdog 拉起，避免抢占 3080 |
+| **npm 更新** | 全局 `npm install -g @deepseek-ai/dsh@<version>`（走官方 registry，不弹镜像密码） |
+
+UI **不再提供**安装/重启按钮；写入类 HTTP 端点（`/install`、`/start-update`、`/restart`）返回 **410 Gone**，提示使用 `dsh_update` 工具。
+
+## HTTP API（只读）
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/dsh-version-updater/status` | GET | 同源 status（含 source / transport / updateAvailable） |
+| `/dsh-version-updater/check` | POST | 纯检测，不安装、不重启、不询问密码 |
+| `/dsh-version-updater/install` | * | 410 — 请用 `dsh_update` |
+| `/dsh-version-updater/start-update` | * | 410 |
+| `/dsh-version-updater/restart` | * | 410 |
+
+## MCP 工具
+
+| 工具 | 作用 |
+|------|------|
+| `dsh_update_check` | 同源只读检测 |
+| `dsh_update` | 启动同源更新；`restart` / `force`；镜像密码由工具代码读取，缺失则弹出 userQuestions UI |
+| `dsh_update_status` | 即时快照（用户追问时） |
+| `dsh_update_watch` | **默认进度循环**：阻塞到启动 / 1 分 / 5 分 / 每 10 分 / 终态，再让 Agent 用 `summary` 汇报 |
+| `dsh_update_rollback` | npm 回滚到 backup 版本；GitHub 回滚到记录的 live root |
+
+**约束：** 不接受 caller 指定的 `source`；检测类调用不触发密码交互；镜像密码存于 `$DSH_HOME/version-autoupdate/credentials.json`。
+
+## 自然语言怎么用
+
+插件会向 Agent 注入指引。新开对话后可直接说：
+
+```text
+检查一下 DSH 有没有更新
 ```
 
-使用当前 DSH 版本的插件管理流程加载该包。包声明 `dsh.bundle.patch` 和 `exports["./client"]`；如手动配置 profile，Host 插件行如下：
-
-```yaml
-- id: dsh-version-autoupdate
-  name: dsh-version-autoupdate
-  config:
-    channel: preview
-    updatePolicy: platform
+```text
+有更新的话就更新 DSH，先不要重启；告诉我进度
 ```
 
-启动或重启 `dsh web` 后，通过浮动胶囊查看版本并执行检查、安装、确认重启。POSIX 上默认仅检测，可按部署情况选择 `full` 或通过原安装方式手动升级。
+```text
+更新 DSH 并重启
+```
 
-## 配置
+```text
+强制重新安装当前最新版（force=true）并重启，然后用 dsh_update_status 报告进度
+```
 
-| 字段 | Schema 默认值 | 说明 |
-| --- | --- | --- |
-| `packageManager` | `npm` | `npm` / `pnpm` / `yarn` / `auto` |
-| `packageManagerPath` | 无 | 包管理器可执行文件的绝对路径；仍会核对全局安装目录 |
-| `channel` | `preview` | 最高版本含 alpha/rc；`stable` 仅正式版，无正式版时回退 |
-| `updatePolicy` | `platform` | Windows CLI 可更新，Linux/macOS 仅检测；可选 `full` / `detect-only`，安装来源限制始终生效 |
-| `minAvailableMemoryMb` | `400` | Linux 可用内存低于阈值时拒绝更新；`0` 关闭 |
-| `installTimeoutMs` | `1200000` | 安装总超时，默认 20 分钟 |
-| `installIdleTimeoutMs` | `0` | 无输出超时，默认关闭，避免 npm 静默下载时被误终止 |
-| `installGraceMs` | `60000` | 终止后的等待时间 |
-| `autoRestart` | `false` | 保留的重启策略项；当前分步流程仍需点击确认重启，Windows 不自动重启 |
-| `restartDelayMs` | `2000` | 确认重启后的延迟 |
-| `offlineInstall` | `auto` | Linux 低内存离线安装；`always` / `never` 可覆盖。随包模板使用 `never` |
-| `offlineInstallMaxMemMb` | `2560` | `auto` 模式的总内存阈值 |
-| `systemdUnit` | `dsh-web.service` | 离线安装停止和启动的 systemd unit |
-| `trustedOrigins` | `[]` | 反向代理改写 Host 时允许的来源主机名，由部署者设置 |
-| `force` | `false` | 状态请求绕过 registry 缓存 |
+```text
+回滚刚才的 DSH 更新
+```
 
-重启日志、离线日志和状态文件使用非空 `DSH_HOME`，未设置时使用 `~/.dsh`；支持 `~` 展开。插件未提供独立的 home 配置项。
+Agent 应自动调用 `dsh_update_check` → `dsh_update` → 循环 `dsh_update_watch`（直到 `done`）。用户追问进度时用 `dsh_update_status`。若模型没点到工具，可点名：`调用 dsh_update`，参数 `force=true`，`restart=true`。
 
-## 兼容性和验证
+## 配置（`cordis.patch.yml`）
 
-适配依据为 DSH `0.2.0-rc.2` 及 `0.2.1-alpha.1` 官方源码。当前 Node 预检遵循上游根清单的 `^22.19.0 || >=24.0.0`，拒绝 Node 23；目标版本以后若变更要求，需要重新适配。
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `updatePolicy` | `platform` | Windows 可装可重启；Linux/macOS 仅检测。`full` / `detect-only` 可覆盖 |
+| `channel` | `preview` | `stable` 只追正式版 |
+| `packageManager` / `packageManagerPath` | npm | npm 更新用的包管理器 |
+| `installTimeoutMs` | `1200000` | npm 全局安装超时（毫秒） |
+| `autoRestart` | `false` | 旧向导用；MCP 显式 `restart: true` 时强制重启 |
+| `force` | `false` | `/status` 绕过 registry 缓存 |
 
-已移除旧 `dsh-client-runtime` 包依赖，客户端仍使用 ModuleLoader 和 `shell.overlay`，React 由 DSH 提供。Host 路由与客户端挂载都随插件生命周期清理。
+## 本地开发（Windows）
 
-仓库测试包含模拟服务、客户端 bundle 加载、安装目标核对与回归测试，不会执行真实 npm 全局安装或成功重启。真实 DSH Web/桌面验收、alpha 的代理路径前缀支持尚未完成；不能将构建或模拟测试通过视为实际部署验证。
+插件源码目录：`D:\0HAN\Work\dsh-plugins\dsh-version-autoupdate`
 
-## HTTP API
+```powershell
+npm install --legacy-peer-deps
+npm test
+D:\0HAN\Work\dsh-plugins\sync-to-dsh.ps1
+```
 
-- `GET /dsh-version-updater/status`
-- `POST /dsh-version-updater/check`
-- `POST /dsh-version-updater/install`
-- `POST /dsh-version-updater/restart`
-- `POST /dsh-version-updater/start-update`：兼容旧入口，目前只启动检查，返回分步流程提示。
+然后 **关闭 Watchdog → 双击「DSH Web」** 重启 DSH（不要用插件仓库 UI 的 detached 重启）。
 
-方法不匹配返回 405；写操作检查来源；重复操作不能覆盖进行中的更新状态。重启在更新执行期间返回 409。
-
-## 更新故障排查
-
-全局目录不一致：确认 `packageManagerPath` 对应当前 DSH 安装，而不是 PATH 中的另一套 Node。npx、本地项目或桌面安装请按原方式升级。
-
-安装超时：检查日志与网络，必要时增大 `installTimeoutMs`，或使用已确认的包管理器路径手动安装目标版本。不要把超时等同于安装损坏；若安装失败且 DSH 无法启动，可按原安装方式恢复上一个正常版本。
-
-## 开发
+## 验证
 
 ```bash
-npm ci
-npm test                 # 客户端类型检查、构建、全部回归测试
+npm test
 npm run build
-npm pack --dry-run       # prepack 自动重新构建并检查发布文件
+npm pack --dry-run
+git diff --check
 ```
-
-构建输出在 `lib/`；新增 `.mjs` 和类型声明会自动复制，发布包包含源码子路径与客户端类型声明。客户端使用外部 source map，避免把调试数据内嵌到加载脚本。
 
 ## 许可
 

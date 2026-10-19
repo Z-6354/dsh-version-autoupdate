@@ -8,11 +8,11 @@ import { type UpdatePolicy } from './platform-policy.js';
  * exposes:
  *  - a startup self-checked version/status computation (running/installed/latest),
  *  - a same-origin HTTP JSON API on `/dsh-version-updater/*` (via `ctx.webServer`),
- *    so the browser half can read status and trigger an npm update,
- *  - an npm install -g update routine with live progress tail.
+ *    so the browser half can read source-aware status.
  */
 export declare const name = "dsh-version-autoupdate";
 export { versionCompare } from './semver.js';
+export { collectInstallationEvidence } from './source-evidence.js';
 /**
  * Services the host half depends on. Declaring `inject` tells DSH/Cordis to
  * activate this plugin only once these are ready and to expose them on the

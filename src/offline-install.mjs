@@ -5,7 +5,7 @@
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { resolveDshHome } from './dsh-home.mjs';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { resolveRestartPlan } from './dsh-restart.mjs';
 
@@ -14,7 +14,7 @@ function shellQuote(s) {
 }
 
 export function dshStateDir() {
-  const dir = resolveDshHome();
+  const dir = join(os.homedir(), '.dsh');
   try {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   } catch { /* ignore */ }
